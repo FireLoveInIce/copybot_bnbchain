@@ -1,0 +1,81 @@
+/**
+ * TokenIdentifierSample - JavaScript Version
+ */
+
+const Web3 = require('web3');
+
+class TokenIdentifierSample {
+    
+    static TOKEN_TYPE_TAX = 5;       // TaxToken
+    
+    constructor(web3OrProvider) {
+        this.web3 = web3OrProvider instanceof Web3 ? web3OrProvider : new Web3(web3OrProvider);
+        
+        const TOKEN_MANAGER = '0x5c952063c7fc8610FFDB798152D69F0B9550762b';
+        
+        this.tokenManager = new this.web3.eth.Contract([
+            {
+                "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+                "name": "_tokenInfos",
+                "outputs": [{"internalType": "uint256", "name": "template", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+                "name": "_tokenInfoEx1s",
+                "outputs": [
+                    {"internalType": "uint256", "name": "launchFee", "type": "uint256"},
+                    {"internalType": "uint256", "name": "pcFee", "type": "uint256"},
+                    {"internalType": "uint256", "name": "feeSetting", "type": "uint256"},
+                    {"internalType": "uint256", "name": "blockNumber", "type": "uint256"},
+                    {"internalType": "uint256", "name": "extraFee", "type": "uint256"}
+                ],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ], TOKEN_MANAGER);
+    }
+    
+    /**
+     * Get the creator type of a token
+     * @param {string} tokenAddress - Token address
+     * @returns {Promise<number>} Creator type value
+     */
+    async getCreatorType(tokenAddress) {
+        const tokenInfo = await this.tokenManager.methods._tokenInfos(tokenAddress).call();
+        const template = BigInt(tokenInfo.template);
+        return Number((template >> BigInt(10)) & BigInt(0x3F));
+    }
+    
+    /**
+     * Check if a token is a TaxToken
+     * @param {string} tokenAddress - Token address
+     * @returns {Promise<boolean>} True if the token is a TaxToken (creatorType == 5)
+     */
+    async isTaxToken(tokenAddress) {
+        const creatorType = await this.getCreatorType(tokenAddress);
+        return creatorType === TokenIdentifierSample.TOKEN_TYPE_TAX;
+    }
+    
+    /**
+     * Check if a token has AntiSniperFeeMode enabled
+     * @param {string} tokenAddress - Token address
+     * @returns {Promise<boolean>} True if AntiSniperFeeMode is enabled (feeSetting > 0)
+     * 
+     * @example
+     * const identifier = new TokenIdentifierSample(web3);
+     * const isAnti = await identifier.isAntiSniperFeeMode('0x...');
+     * if (isAnti) {
+     *     console.log('Token has AntiSniperFeeMode enabled');
+     * }
+     */
+    async isAntiSniperFeeMode(tokenAddress) {
+        const tokenInfoEx1 = await this.tokenManager.methods._tokenInfoEx1s(tokenAddress).call();
+        return BigInt(tokenInfoEx1.feeSetting) > BigInt(0);
+    }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = TokenIdentifierSample;
+}

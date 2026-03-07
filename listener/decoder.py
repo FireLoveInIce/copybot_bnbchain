@@ -68,6 +68,12 @@ SWAP_V2_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d
 #        uint128 liquidity, int24 tick)
 SWAP_V3_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 
+# PancakeSwap V3 variant (extra protocolFees fields, same amount0/amount1 layout):
+#   Swap(address indexed sender, address indexed recipient,
+#        int256 amount0, int256 amount1, uint160 sqrtPriceX96,
+#        uint128 liquidity, int24 tick, uint128 protocolFeesToken0, uint128 protocolFeesToken1)
+SWAP_V3_TOPIC_PANCAKE = "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83"
+
 # ---------------------------------------------------------------------------
 # Convenient sets for quick lookup
 # ---------------------------------------------------------------------------
@@ -114,6 +120,7 @@ class ReceiptDecoder:
         target: str,
         block_number: int,
         tx_value: int = 0,
+        tx_to: str = "",
     ) -> list[TradeEvent]:
         """
         Analyse all logs from a single transaction receipt.
@@ -126,6 +133,7 @@ class ReceiptDecoder:
             target:       lower-case target address we are monitoring
             block_number: block number
             tx_value:     native BNB value sent with the transaction (wei)
+            tx_to:        transaction recipient (to field), used to identify router
         """
         # Try platform-specific events first (highest priority)
         events = self._check_fourmeme(tx_hash, tx_from, logs, target, block_number, tx_value)
@@ -137,7 +145,7 @@ class ReceiptDecoder:
             return events
 
         # Try DEX swap events
-        events = self._check_dex_swaps(tx_hash, tx_from, logs, target, block_number, tx_value)
+        events = self._check_dex_swaps(tx_hash, tx_from, logs, target, block_number, tx_value, tx_to)
         if events:
             return events
 
@@ -313,6 +321,7 @@ class ReceiptDecoder:
     def _check_dex_swaps(
         self, tx_hash: str, tx_from: str, logs: list[dict],
         target: str, block_number: int, tx_value: int = 0,
+        tx_to: str = "",
     ) -> list[TradeEvent]:
         """Detect swap events and correlate with Transfer events to determine
         token, direction, and amounts relative to the target.
@@ -349,7 +358,7 @@ class ReceiptDecoder:
 
             elif topic0 == SWAP_V2_TOPIC:
                 swap_events.append({"type": "v2", "log": log, "pair": _log_addr(log)})
-            elif topic0 == SWAP_V3_TOPIC:
+            elif topic0 in (SWAP_V3_TOPIC, SWAP_V3_TOPIC_PANCAKE):
                 swap_events.append({"type": "v3", "log": log, "pair": _log_addr(log)})
 
         if not swap_events:
@@ -388,9 +397,13 @@ class ReceiptDecoder:
                     if wbnb_in:
                         bnb_amount = sum(w["value"] for w in wbnb_in) / 1e18
                     else:
-                        # Intermediary sells: WBNB goes to intermediary, not target.
-                        # Only count WBNB from actual swap pair contracts.
-                        bnb_amount = _sum_wbnb_from_pairs(all_transfers, swap_pairs) / 1e18
+                        # Only count WBNB from swap pairs that goes to the target
+                        # or the router (tx.to). This avoids counting tax auto-sells
+                        # that route through the same pair but pay a different address.
+                        recipients = {target}
+                        if tx_to:
+                            recipients.add(tx_to)
+                        bnb_amount = _sum_wbnb_from_pairs_to(all_transfers, swap_pairs, recipients) / 1e18
                     events.append(TradeEvent(
                         platform=_token_platform(t["token"]), action="sell",
                         token=t["token"], trader=target,
@@ -627,6 +640,17 @@ def _extract_transfers(logs: list[dict]) -> list[dict]:
             "value": _uint_at(_strip_hex(log.get("data") or "0x"), 0),
         })
     return result
+
+
+def _sum_wbnb_from_pairs_to(
+    all_transfers: list[dict], swap_pair_addrs: set[str], recipients: set[str],
+) -> int:
+    """Sum WBNB sent FROM swap pair contracts TO specific recipients (target/router)."""
+    total = 0
+    for t in all_transfers:
+        if t["token"] == _WBNB and t["from"] in swap_pair_addrs and t["to"] in recipients:
+            total += t["value"]
+    return total
 
 
 def _sum_wbnb_from_pairs(all_transfers: list[dict], swap_pair_addrs: set[str] | None = None) -> int:

@@ -125,9 +125,12 @@
             font-size: 11px; border: 1px solid var(--line); font-family: "JetBrains Mono", monospace;
         }
         .badge-running  { border-color: rgba(31,216,200,.4); color: var(--c1); }
-        .badge-paused   { border-color: rgba(247,181,85,.4); color: var(--c2); }
+        .badge-paused   { border-color: rgba(247,181,85,.5); color: var(--c2); background: rgba(247,181,85,.1); font-weight: 700; }
         .badge-pending  { border-color: var(--line); color: var(--muted); }
-        .badge-interrupted { border-color: rgba(255,124,112,.4); color: var(--c3); }
+        .badge-interrupted { border-color: rgba(255,124,112,.5); color: var(--c3); background: rgba(255,124,112,.12); font-weight: 700; animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red { 0%,100% { opacity:1; } 50% { opacity:.55; } }
+        .listener-row-warn { background: rgba(247,181,85,.04); }
+        .listener-row-error { background: rgba(255,124,112,.06); }
         .badge-buy  { color: var(--c1); }
         .badge-sell { color: var(--c3); }
 
@@ -177,6 +180,25 @@
             animation: fadeIn .2s ease;
         }
         @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+
+        /* warn popup (listener pause/error) */
+        .warn-popup {
+            position: fixed; top: 24px; right: 24px; z-index: 998;
+            border-radius: 12px; padding: 14px 20px;
+            font-size: 13px; max-width: 420px;
+            display: flex; align-items: flex-start; gap: 10px;
+            animation: slideIn .3s ease;
+            box-shadow: 0 8px 32px rgba(0,0,0,.5);
+        }
+        .warn-popup.warn  { background: rgba(20,16,6,.96); border: 1px solid rgba(247,181,85,.4); color: var(--c2); }
+        .warn-popup.error { background: rgba(20,6,6,.96); border: 1px solid rgba(255,124,112,.4); color: var(--c3); }
+        .warn-popup .warn-icon { font-size: 20px; flex-shrink: 0; line-height: 1; }
+        .warn-popup .warn-body { flex: 1; }
+        .warn-popup .warn-title { font-weight: 700; margin-bottom: 4px; }
+        .warn-popup .warn-msg { font-size: 12px; opacity: .85; }
+        .warn-popup .warn-close { cursor: pointer; font-size: 16px; opacity: .6; margin-left: 8px; flex-shrink: 0; }
+        .warn-popup .warn-close:hover { opacity: 1; }
+        @keyframes slideIn { from { opacity:0; transform:translateX(40px); } to { opacity:1; transform:translateX(0); } }
 
         /* section hidden */
         .page { display: none; }
@@ -419,7 +441,9 @@
                             </template>
                         </span>
                         <!-- amount -->
-                        <span class="act-amt" v-if="fmtActivityAmount(tx)">{{ fmtActivityAmount(tx) }}</span>
+                        <span class="act-amt" v-if="fmtActivityAmount(tx)">
+                            {{ fmtActivityAmount(tx) }}
+                        </span>
                         <!-- tx link -->
                         <a :href="'https://bscscan.com/tx/'+tx.tx_hash" target="_blank" rel="noopener"
                            style="color:var(--muted);font-size:10px;text-decoration:none;flex-shrink:0"
@@ -606,7 +630,11 @@
                     <tbody>
                         <tr v-for="t in listenerTasks" :key="t.id"
                             class="task-row-clickable"
-                            :class="{ 'task-row-active': selectedListenerTask && selectedListenerTask.id===t.id }"
+                            :class="{
+                                'task-row-active': selectedListenerTask && selectedListenerTask.id===t.id,
+                                'listener-row-warn': t.status==='paused',
+                                'listener-row-error': t.status==='interrupted',
+                            }"
                             @click="openListenerDetail(t)">
                             <td class="muted">#{{ t.id }}</td>
                             <td>
@@ -647,7 +675,13 @@
                                 </span>
                             </td>
                             <td class="muted">{{ t.chain }}</td>
-                            <td><span class="badge" :class="'badge-'+t.status">{{ t.status }}</span></td>
+                            <td>
+                                <span class="badge" :class="'badge-'+t.status">
+                                    <template v-if="t.status==='paused'">⏸ </template>
+                                    <template v-if="t.status==='interrupted'">⚠ </template>
+                                    {{ t.status }}
+                                </span>
+                            </td>
                             <td class="muted" style="font-size:11px;white-space:nowrap">{{ fmtTime(t.created_at) }}</td>
                             <td class="muted" style="font-size:11px;white-space:nowrap">{{ listenerStartTimes[t.id] ? fmtTime(listenerStartTimes[t.id]) : '--' }}</td>
                             <td @click.stop style="white-space:nowrap">
@@ -656,6 +690,9 @@
                                             :disabled="t.status==='running'">Start</button>
                                     <button class="btn btn-warn" @click="setTaskStatus('listener',t.id,'paused')"
                                             :disabled="t.status!=='running'">Pause</button>
+                                    <button class="btn btn-danger" @click="deleteListenerTask(t)"
+                                            :disabled="t.status==='running'"
+                                            title="Delete listener">✕</button>
                                 </div>
                             </td>
                         </tr>
@@ -968,6 +1005,18 @@
 
     <!-- Toast -->
     <div class="toast" v-if="toast">{{ toast }}</div>
+
+    <!-- Warn popups for listener pause / interrupted -->
+    <div v-for="(w, i) in warnPopups" :key="i"
+         class="warn-popup" :class="w.type"
+         :style="'top:' + (24 + i * 76) + 'px'">
+        <span class="warn-icon">{{ w.type === 'error' ? '⚠' : '⏸' }}</span>
+        <div class="warn-body">
+            <div class="warn-title">{{ w.title }}</div>
+            <div class="warn-msg">{{ w.msg }}</div>
+        </div>
+        <span class="warn-close" @click="warnPopups.splice(i, 1)">✕</span>
+    </div>
 
     <!-- ══════════════════ MODALS ══════════════════ -->
     <div class="modal-overlay" v-if="modal" @click.self="closeModal">

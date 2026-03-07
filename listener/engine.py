@@ -9,6 +9,7 @@ guarantees no blocks are ever skipped.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 
@@ -50,6 +51,7 @@ class BlockStream:
         self._subscribers: dict[str, set[tuple]] = {}
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._cursor: int | None = None  # persists across stop/restart
 
     async def subscribe(self, target: str, task_id: int, task: dict, callback):
         """Register a listener task. Starts the stream if not running."""
@@ -104,8 +106,8 @@ class BlockStream:
 
     async def _run(self) -> None:
         """Main poll loop with block cursor — never skips a block."""
-        cursor: int | None = None   # last successfully processed block
         retry_delay = 1.0
+        _gc_counter = 0
 
         await self.log.push(
             f"block stream ({self.chain}) started (HTTP poll, {LISTENER_POLL_INTERVAL}s)",
@@ -118,16 +120,20 @@ class BlockStream:
                 head = await w3.eth.block_number
 
                 # First run: start from current block (don't replay history)
-                if cursor is None:
-                    cursor = head - 1
+                if self._cursor is None:
+                    self._cursor = head - 1
 
                 # Process blocks one by one; stop on failure (don't advance cursor)
-                while cursor < head and self._subscribers:
-                    next_bn = cursor + 1
+                while self._cursor < head and self._subscribers:
+                    next_bn = self._cursor + 1
                     block = await w3.eth.get_block(next_bn, full_transactions=True)
                     await self._fan_out(block)
-                    cursor = next_bn  # only advance after success
+                    self._cursor = next_bn  # only advance after success
                     retry_delay = 1.0  # reset backoff on success
+                    _gc_counter += 1
+                    if _gc_counter >= 100:
+                        gc.collect()
+                        _gc_counter = 0
 
             except asyncio.CancelledError:
                 raise
@@ -136,7 +142,7 @@ class BlockStream:
                 logger.debug("block stream poll error: %s", exc)
                 if retry_delay >= 8:
                     await self.log.push(
-                        f"block stream ({self.chain}) retrying block {(cursor or 0) + 1} "
+                        f"block stream ({self.chain}) retrying block {(self._cursor or 0) + 1} "
                         f"in {retry_delay:.0f}s: {exc}",
                         "WARNING", "listener",
                     )
@@ -230,6 +236,7 @@ class ListenerEngine:
 
             tx = await w3.eth.get_transaction(tx_hash)
             tx_from = str(tx.get("from", "")).lower() if tx else ""
+            tx_to = str(tx.get("to", "")).lower() if tx and tx.get("to") else ""
             tx_value = int(tx.get("value", 0)) if tx else 0
 
             # Normalise logs to plain dicts with hex strings
@@ -245,6 +252,7 @@ class ListenerEngine:
                 target=target,
                 block_number=block_number or 0,
                 tx_value=tx_value,
+                tx_to=tx_to,
             )
 
             for event in events:

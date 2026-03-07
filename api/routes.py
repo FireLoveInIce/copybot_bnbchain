@@ -318,6 +318,46 @@ def build_router(
 
         return {"status": "ok", "task_id": task_id, "new_status": payload.status}
 
+    @router.delete("/api/listener-tasks/{task_id}")
+    async def delete_listener_task(task_id: int):
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Check task exists and is not running
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT id, status FROM listener_tasks WHERE id = ?", (task_id,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="task not found")
+            if row["status"] == "running":
+                raise HTTPException(status_code=400, detail="stop the listener before deleting")
+
+            # TODO: check copy_tasks linked to this listener's target_address
+            # For now copy trade is not functional, but block delete if linked
+            cur2 = await db.execute(
+                "SELECT COUNT(1) FROM copy_tasks WHERE target_address = "
+                "(SELECT target_address FROM listener_tasks WHERE id = ?)",
+                (task_id,),
+            )
+            if (await cur2.fetchone())[0] > 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="cannot delete: copy trade task is linked to this listener's target",
+                )
+
+            # Delete related transactions and the task itself
+            await db.execute(
+                "DELETE FROM transactions WHERE source_task_id = ? AND source_task_type = 'listener'",
+                (task_id,),
+            )
+            await db.execute("DELETE FROM listener_tasks WHERE id = ?", (task_id,))
+            await db.commit()
+
+        await log_service.push(
+            f"listener #{task_id} deleted", "WARNING", "listener"
+        )
+        return {"status": "ok", "task_id": task_id}
+
     # ------------------------------------------------------------------
     # Copy tasks
     # ------------------------------------------------------------------

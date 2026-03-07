@@ -99,6 +99,7 @@ createApp({
       },
 
       logFilter: "",  // category filter on dashboard log panel
+      warnPopups: [],  // [{type:'warn'|'error', title:'...', msg:'...'}]
     };
   },
 
@@ -593,11 +594,18 @@ createApp({
       if (!amt) return '';
       const quote = this.quoteLabel(ev);
       if (quote === 'BNB' && this.bnbPrice) {
-        const usd = (amt * this.bnbPrice).toFixed(1);
+        const usd = this.fmtNum((amt * this.bnbPrice).toFixed(1));
         return `${amt.toFixed(4)} BNB ($${usd})`;
       }
       if (quote === 'BNB') return `${amt.toFixed(4)} BNB`;
-      return `$${amt.toFixed(2)} ${quote}`;
+      return `$${this.fmtNum(amt.toFixed(2))} ${quote}`;
+    },
+    fmtNum(n) {
+      // Add commas to number string: 1234567 → 1,234,567
+      const s = String(n);
+      const parts = s.split('.');
+      parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return parts.join('.');
     },
     fmtTokenAmt(amtStr) {
       if (!amtStr || amtStr === '0') return '—';
@@ -608,7 +616,7 @@ createApp({
         const whole = n / divisor;
         const frac = n % divisor;
         const fracStr = frac.toString().padStart(decimals, '0').slice(0, 4);
-        return `${whole}.${fracStr}`;
+        return `${this.fmtNum(whole)}.${fracStr}`;
       } catch {
         return amtStr;
       }
@@ -663,13 +671,12 @@ createApp({
       const quote = this.quoteLabel(tx);
       if (quote === 'BNB') {
         if (this.bnbPrice) {
-          const usd = (amt * this.bnbPrice).toFixed(0);
+          const usd = this.fmtNum((amt * this.bnbPrice).toFixed(0));
           return `$${usd} (${amt.toFixed(4)} BNB)`;
         }
         return `${amt.toFixed(4)} BNB`;
       }
-      // Stablecoin — amount is already in USD units
-      return `$${amt.toFixed(2)} (${amt.toFixed(2)} ${quote})`;
+      return `$${this.fmtNum(amt.toFixed(2))} (${this.fmtNum(amt.toFixed(2))} ${quote})`;
     },
 
     // ── Listener ───────────────────────────────────────────────────────
@@ -707,6 +714,28 @@ createApp({
         }
         this.showToast(`Renamed to "${task.label}"`);
       } catch (e) { this.showToast(`Rename failed: ${e.message}`); }
+    },
+
+    pushWarn(type, title, msg, ms = 8000) {
+      this.warnPopups.push({ type, title, msg });
+      if (this.warnPopups.length > 4) this.warnPopups.shift();
+      setTimeout(() => {
+        const idx = this.warnPopups.findIndex(w => w.title === title && w.msg === msg);
+        if (idx >= 0) this.warnPopups.splice(idx, 1);
+      }, ms);
+    },
+
+    async deleteListenerTask(task) {
+      if (task.status === 'running') {
+        this.showToast('Stop the listener before deleting'); return;
+      }
+      if (!confirm(`Delete listener #${task.id}${task.label ? ' (' + task.label + ')' : ''}? This will also delete all its detected events.`)) return;
+      try {
+        await this.api(`/api/listener-tasks/${task.id}`, { method: 'DELETE' });
+        this.showToast(`Listener #${task.id} deleted`);
+        if (this.selectedListenerTask?.id === task.id) this.closeListenerDetail();
+        await Promise.all([this.loadListenerTasks(), this.loadStats()]);
+      } catch (e) { this.showToast(`Delete failed: ${e.message}`); }
     },
 
     async createListenerTask() {
@@ -859,6 +888,23 @@ createApp({
         });
         // Keep stats fresh on every backend event
         this.loadStats();
+        // Warn popup when listener pauses or gets interrupted
+        if (d.category === 'listener' && d.message) {
+          const m = d.message;
+          if (/paused/i.test(m)) {
+            const id = m.match(/#(\d+)/)?.[1] || '?';
+            const task = this.listenerTaskMap[id];
+            const label = task?.label ? ` (${task.label})` : '';
+            this.pushWarn('warn', `Listener #${id}${label} paused`, 'The listener has stopped watching. Restart it to continue monitoring.');
+            this.loadListenerTasks();
+          } else if (/error|interrupted|failed/i.test(m) && d.level === 'ERROR') {
+            const id = m.match(/#(\d+)/)?.[1] || '?';
+            const task = this.listenerTaskMap[id];
+            const label = task?.label ? ` (${task.label})` : '';
+            this.pushWarn('error', `Listener #${id}${label} error`, m.slice(0, 120));
+            this.loadListenerTasks();
+          }
+        }
         // If a listener trade event comes in, update unread count or refresh detail panel
         if (d.category === 'listener' && d.task_id) {
           if (this.selectedListenerTask?.id === d.task_id) {

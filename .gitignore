@@ -23,3 +23,7 @@ Thumbs.db
 data/genedWallet.txt
 *temp*
 .claudeignore
+
+# useless for new runner
+abi/
+scripts/

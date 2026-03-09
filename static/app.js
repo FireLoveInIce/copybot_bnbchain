@@ -74,13 +74,16 @@ createApp({
       bnbPrice: null,
 
       copyForm: {
-        target_address: "",
+        listener_task_id: null,
         wallet_id: null,
         buy_mode: "fixed",
-        buy_value: 0.2,
-        sell_mode: "mirror",
-        slippage: 3,
-        gas_multiplier: 1.1,
+        fixedAmount: 0.1,
+        conditions: [{ min_bnb: 1, amount: 0.01 }],
+        sell_mode: "both",
+        takeProfit: 50,
+        stopLoss: 20,
+        slippage: 10,
+        gas_multiplier: 1.2,
       },
 
       strategyForm: {
@@ -98,10 +101,20 @@ createApp({
         chain_id: 56,
       },
 
+      copyWalletBal: null,   // BNB balance for selected copy-trade wallet
+      copyTargetBal: null,   // BNB balance for selected listener target
+      copyTargetAddr: "",    // target address for display
+
+      // ── Copy task detail panel ─────────────────────────────────────────
+      selectedCopyTask: null,
+      copyRecords: [],
+      copyRecordsLoading: false,
+
       logFilter: "",  // category filter on dashboard log panel
       warnPopups: [],  // [{type:'warn'|'error', title:'...', msg:'...'}]
     };
   },
+
 
   computed: {
     filteredLogs() {
@@ -271,6 +284,29 @@ createApp({
     async loadCopyTasks() {
       try { this.copyTasks = await this.api("/api/copy-tasks"); } catch (_) {}
     },
+    async openCopyDetail(task) {
+      if (this.selectedCopyTask?.id === task.id) {
+        this.closeCopyDetail(); return;
+      }
+      this.closeCopyDetail();
+      this.selectedCopyTask = task;
+      this.copyRecords = [];
+      await this.loadCopyRecords(task.id);
+    },
+    closeCopyDetail() {
+      this.selectedCopyTask = null;
+      this.copyRecords = [];
+    },
+    async loadCopyRecords(taskId) {
+      const id = taskId || this.selectedCopyTask?.id;
+      if (!id) return;
+      this.copyRecordsLoading = true;
+      try {
+        this.copyRecords = await this.api(`/api/copy-tasks/${id}/records`);
+        this.prefetchTokenNames(this.copyRecords);
+      } catch (_) {}
+      finally { this.copyRecordsLoading = false; }
+    },
     async loadStrategyTasks() {
       try { this.strategyTasks = await this.api("/api/strategy-tasks"); } catch (_) {}
     },
@@ -285,7 +321,11 @@ createApp({
       } catch (_) {}
     },
     async loadRpcConfigs() {
-      try { this.rpcConfigs = await this.api("/api/rpc-configs"); } catch (_) {}
+      try {
+        const configs = await this.api("/api/rpc-configs");
+        for (const r of configs) r._tradeRpc = r.trade_rpc_url || "";
+        this.rpcConfigs = configs;
+      } catch (_) {}
     },
     async loadLogs() {
       try {
@@ -584,6 +624,62 @@ createApp({
       if (p === 'dex')      return 'border-color:rgba(247,181,85,.3);color:var(--c2)';
       return 'border-color:var(--line);color:var(--muted)';
     },
+    reasonStyle(r) {
+      if (r === 'take_profit') return 'border-color:rgba(31,216,200,.3);color:var(--c1)';
+      if (r === 'stop_loss')   return 'border-color:rgba(255,124,112,.3);color:var(--c3)';
+      if (r === 'manual')      return 'border-color:rgba(79,158,255,.3);color:var(--c4)';
+      return 'border-color:rgba(247,181,85,.3);color:var(--c2)';  // follow
+    },
+    reasonLabel(r) {
+      if (r === 'take_profit') return 'TP';
+      if (r === 'stop_loss')   return 'SL';
+      if (r === 'manual')      return 'Manual';
+      return 'Follow';
+    },
+    async manualSellPosition(rec) {
+      if (!confirm(`Sell all $${this.tokenSymbol(rec.token)} from this position?`)) return;
+      try {
+        const r = await this.api(`/api/copy-positions/${rec.position_id}/sell`, {
+          method: "POST",
+          body: JSON.stringify({ slippage: this.selectedCopyTask?.slippage || 5 }),
+        });
+        this.showToast(`Sell submitted: ${r.tx_hash ? r.tx_hash.slice(0,12) + '...' : r.message}`);
+        await this.loadCopyRecords(this.selectedCopyTask.id);
+      } catch (e) { this.showToast(`Sell failed: ${e.message}`); }
+    },
+    fmtBuyConfig(task) {
+      try {
+        const c = JSON.parse(task.buy_config || '{}');
+        if (task.buy_mode === 'fixed') return `${c.amount || task.buy_value} BNB`;
+        const conds = c.conditions || [];
+        return conds.map(c => `>${c.min_bnb} → ${c.amount}`).join(' | ') || `${task.buy_value} BNB`;
+      } catch { return `${task.buy_value} BNB`; }
+    },
+    fmtSellConfig(task) {
+      try {
+        const c = JSON.parse(task.sell_config || '{}');
+        if (task.sell_mode === 'copy_sell') return 'Follow';
+        const parts = [];
+        if (task.sell_mode === 'both') parts.push('Follow');
+        if (c.take_profit) parts.push(`TP ${c.take_profit}%`);
+        if (c.stop_loss) parts.push(`SL ${c.stop_loss}%`);
+        return parts.join(' + ') || task.sell_mode;
+      } catch { return task.sell_mode; }
+    },
+    recordExtra(rec) {
+      return this.parseExtra(rec.extra);
+    },
+    fmtBnbUsd(amt) {
+      const n = Number(amt);
+      if (!n && n !== 0) return '—';
+      const abs = Math.abs(n);
+      let s = abs.toFixed(4) + ' BNB';
+      if (this.bnbPrice) {
+        const usd = this.fmtNum((abs * this.bnbPrice).toFixed(1));
+        s += ` ($${usd})`;
+      }
+      return (n < 0 ? '-' : '') + s;
+    },
     fmtAction(action) {
       if (action === 'transfer_in')  return 'XFER IN';
       if (action === 'transfer_out') return 'XFER OUT';
@@ -763,24 +859,81 @@ createApp({
     },
 
     // ── Copy trade ─────────────────────────────────────────────────────
+    async fetchCopyWalletBal() {
+      await this.$nextTick();
+      const id = this.copyForm.wallet_id;
+      if (!id) { this.copyWalletBal = null; return; }
+      this.copyWalletBal = "loading";
+      try {
+        const d = await this.api(`/api/wallets/${id}/balance`);
+        this.copyWalletBal = d.balance;
+      } catch (_) {
+        this.copyWalletBal = "error";
+      }
+    },
+
+    async fetchCopyListenerTarget() {
+      await this.$nextTick();
+      const id = this.copyForm.listener_task_id;
+      if (!id) { this.copyTargetBal = null; return; }
+      const lt = this.listenerTasks.find(t => t.id === id);
+      if (!lt) { this.copyTargetBal = null; return; }
+      this.copyTargetAddr = lt.target_address;
+      this.copyTargetBal = "loading";
+      try {
+        const w3bal = await this.api(`/api/wallet-balance?address=${lt.target_address}`);
+        this.copyTargetBal = w3bal.balance;
+      } catch (_) {
+        this.copyTargetBal = "error";
+      }
+    },
+
     async createCopyTask() {
+      const f = this.copyForm;
+      if (!f.listener_task_id || !f.wallet_id) {
+        this.showToast("Select listener and wallet"); return;
+      }
+
+      const buy_config = f.buy_mode === "fixed"
+        ? { amount: Number(f.fixedAmount) }
+        : { conditions: f.conditions.filter(c => c.min_bnb >= 0 && c.amount > 0) };
+
+      const sell_config = (f.sell_mode === "tp_sl" || f.sell_mode === "both")
+        ? { take_profit: Number(f.takeProfit), stop_loss: Number(f.stopLoss) }
+        : {};
+
       try {
         await this.api("/api/copy-tasks", {
           method: "POST",
           body: JSON.stringify({
-            target_address: this.copyForm.target_address,
-            wallet_id: Number(this.copyForm.wallet_id),
-            buy_mode: this.copyForm.buy_mode,
-            buy_value: Number(this.copyForm.buy_value),
-            sell_mode: this.copyForm.sell_mode,
-            slippage: Number(this.copyForm.slippage),
-            gas_multiplier: Number(this.copyForm.gas_multiplier),
-            config: {},
+            listener_task_id: Number(f.listener_task_id),
+            wallet_id: Number(f.wallet_id),
+            buy_mode: f.buy_mode,
+            buy_config,
+            sell_mode: f.sell_mode,
+            sell_config,
+            slippage: Number(f.slippage),
+            gas_multiplier: Number(f.gas_multiplier),
           }),
         });
         this.showToast("Copy trade task created");
+        // Reset form
+        f.listener_task_id = null;
+        f.wallet_id = null;
         await Promise.all([this.loadCopyTasks(), this.loadStats()]);
       } catch (e) { this.showToast(`Create failed: ${e.message}`); }
+    },
+
+    async deleteCopyTask(task) {
+      if (task.status === 'running') {
+        this.showToast('Stop the task before deleting'); return;
+      }
+      if (!confirm(`Delete copy task #${task.id}?`)) return;
+      try {
+        await this.api(`/api/copy-tasks/${task.id}`, { method: 'DELETE' });
+        this.showToast(`Copy task #${task.id} deleted`);
+        await Promise.all([this.loadCopyTasks(), this.loadStats()]);
+      } catch (e) { this.showToast(`Delete failed: ${e.message}`); }
     },
 
     // ── Start all non-running tasks ─────────────────────────────────────
@@ -851,6 +1004,17 @@ createApp({
         await this.loadRpcConfigs();
       } catch (e) { this.showToast(`Switch failed: ${e.message}`); }
     },
+    async saveTradeRpc(r) {
+      const url = (r._tradeRpc || "").trim();
+      try {
+        await this.api(`/api/rpc-configs/${r.id}/trade-rpc`, {
+          method: "PATCH",
+          body: JSON.stringify({ trade_rpc_url: url }),
+        });
+        r.trade_rpc_url = url;
+        this.showToast(url ? "Trade RPC saved" : "Trade RPC cleared");
+      } catch (e) { this.showToast(`Save failed: ${e.message}`); }
+    },
     async deleteRpc(id) {
       try {
         await this.api(`/api/rpc-configs/${id}`, { method: "DELETE" });
@@ -904,6 +1068,10 @@ createApp({
             this.pushWarn('error', `Listener #${id}${label} error`, m.slice(0, 120));
             this.loadListenerTasks();
           }
+        }
+        // Copy trade events: refresh detail panel records on buy/sell
+        if (d.category === 'copytrade' && d.level === 'SUCCESS' && this.selectedCopyTask) {
+          this.loadCopyRecords(this.selectedCopyTask.id);
         }
         // If a listener trade event comes in, update unread count or refresh detail panel
         if (d.category === 'listener' && d.task_id) {

@@ -35,10 +35,9 @@ log_service = LogService()
 rpc_manager = RpcManager()
 wallet_service = WalletService(rpc_manager)
 runtime = RuntimeManager()
-copy_queue: asyncio.Queue = asyncio.Queue()
 
 listener_engine = ListenerEngine(log_service, rpc_manager)
-copy_engine = CopyTradeEngine(log_service, rpc_manager, copy_queue)
+copy_engine = CopyTradeEngine(log_service, rpc_manager, listener_engine)
 strategy_engine = StrategyEngine(log_service, rpc_manager)
 
 
@@ -56,9 +55,6 @@ async def lifespan(_: FastAPI):
         await log_service.push(
             f"recovered interrupted tasks: {recovered}", "WARNING", "system"
         )
-
-    # Start the copy-trade consumer
-    runtime.start_job("copytrade:engine", lambda: copy_engine.run())
 
     await log_service.push("CopyBot started", "SYSTEM", "system")
 
@@ -97,6 +93,7 @@ router = build_router(
     rpc_manager=rpc_manager,
     runtime=runtime,
     listener_engine=listener_engine,
+    copy_engine=copy_engine,
     strategy_engine=strategy_engine,
 )
 app.include_router(router)

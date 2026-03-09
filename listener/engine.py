@@ -104,6 +104,11 @@ class BlockStream:
             for task_id, _tid, callback in list(subs):
                 await self._dispatch(tx_from, task_id, callback, tx_hash)
 
+    # Max blocks behind before we skip ahead (stale blocks are useless for copy-trading)
+    STALE_THRESHOLD = 200
+    # Max concurrent block fetches during catch-up
+    CATCHUP_BATCH = 10
+
     async def _run(self) -> None:
         """Main poll loop with block cursor — never skips a block."""
         retry_delay = 1.0
@@ -123,14 +128,41 @@ class BlockStream:
                 if self._cursor is None:
                     self._cursor = head - 1
 
-                # Process blocks one by one; stop on failure (don't advance cursor)
+                gap = head - self._cursor
+
+                # Skip stale blocks — jump ahead if too far behind
+                if gap > self.STALE_THRESHOLD:
+                    skipped = gap - self.STALE_THRESHOLD
+                    old_cursor = self._cursor
+                    self._cursor = head - self.STALE_THRESHOLD
+                    await self.log.push(
+                        f"⚠️ block stream ({self.chain}) skipped {skipped} stale blocks "
+                        f"({old_cursor} → {self._cursor}), gap was {gap}",
+                        "WARNING", "listener",
+                    )
+
+                # Batch catch-up: fetch multiple blocks in parallel when behind
                 while self._cursor < head and self._subscribers:
-                    next_bn = self._cursor + 1
-                    block = await w3.eth.get_block(next_bn, full_transactions=True)
-                    await self._fan_out(block)
-                    self._cursor = next_bn  # only advance after success
+                    behind = head - self._cursor
+                    batch_size = min(behind, self.CATCHUP_BATCH)
+
+                    if batch_size > 1:
+                        block_nums = [self._cursor + 1 + i for i in range(batch_size)]
+                        blocks = await asyncio.gather(*(
+                            w3.eth.get_block(bn, full_transactions=True)
+                            for bn in block_nums
+                        ))
+                        for bn, block in zip(block_nums, blocks):
+                            await self._fan_out(block)
+                            self._cursor = bn
+                    else:
+                        next_bn = self._cursor + 1
+                        block = await w3.eth.get_block(next_bn, full_transactions=True)
+                        await self._fan_out(block)
+                        self._cursor = next_bn
+
                     retry_delay = 1.0  # reset backoff on success
-                    _gc_counter += 1
+                    _gc_counter += batch_size
                     if _gc_counter >= 100:
                         gc.collect()
                         _gc_counter = 0
@@ -140,14 +172,14 @@ class BlockStream:
             except Exception as exc:
                 # Block fetch or RPC error — retry with backoff, never skip
                 logger.debug("block stream poll error: %s", exc)
-                if retry_delay >= 8:
+                if retry_delay >= 4:
                     await self.log.push(
                         f"block stream ({self.chain}) retrying block {(self._cursor or 0) + 1} "
                         f"in {retry_delay:.0f}s: {exc}",
                         "WARNING", "listener",
                     )
                 await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 30)
+                retry_delay = min(retry_delay * 2, 5)
                 continue  # skip the normal poll sleep, retry immediately
 
             await asyncio.sleep(LISTENER_POLL_INTERVAL)
@@ -164,6 +196,20 @@ class ListenerEngine:
         self._decoder = ReceiptDecoder()
         self._streams: dict[str, BlockStream] = {}  # chain → BlockStream
         self._processed: dict[int, set[str]] = {}    # task_id → processed tx hashes
+        # Copy-trade callbacks: listener_task_id → [async callback(task_id, event)]
+        self._copy_callbacks: dict[int, list] = {}
+
+    def register_copy_callback(self, listener_task_id: int, callback) -> None:
+        if listener_task_id not in self._copy_callbacks:
+            self._copy_callbacks[listener_task_id] = []
+        self._copy_callbacks[listener_task_id].append(callback)
+
+    def unregister_copy_callback(self, listener_task_id: int, callback) -> None:
+        cbs = self._copy_callbacks.get(listener_task_id)
+        if cbs:
+            self._copy_callbacks[listener_task_id] = [c for c in cbs if c is not callback]
+            if not self._copy_callbacks[listener_task_id]:
+                del self._copy_callbacks[listener_task_id]
 
     def _get_stream(self, chain: str) -> BlockStream:
         if chain not in self._streams:
@@ -260,6 +306,13 @@ class ListenerEngine:
                     event.extra["counterparty"] = event.trader
                 await self._persist_event(task_id, task, event)
                 await self._log_event(task_id, event)
+
+                # Dispatch to copy-trade callbacks
+                for cb in self._copy_callbacks.get(task_id, []):
+                    try:
+                        await cb(task_id, event)
+                    except Exception as exc:
+                        logger.debug("copy callback error (task %d): %s", task_id, exc)
 
         except Exception as exc:
             logger.debug("process_tx error (%s): %s", tx_hash, exc)

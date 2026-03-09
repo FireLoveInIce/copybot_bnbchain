@@ -20,6 +20,7 @@ class RpcManager:
     def __init__(self):
         self._http_cache: dict[str, AsyncWeb3] = {}
         self._config_cache: dict[str, dict] = {}
+        self._trade_http_cache: dict[str, AsyncWeb3] = {}
 
     async def get_config(self, chain: str = "bsc") -> dict:
         """Return the active RPC config for *chain* from DB, with fallback."""
@@ -51,6 +52,7 @@ class RpcManager:
         """Call after updating rpc_configs so the cache is refreshed."""
         self._config_cache.pop(chain, None)
         self._http_cache.pop(chain, None)
+        self._trade_http_cache.pop(chain, None)
 
     async def get_http(self, chain: str = "bsc") -> AsyncWeb3:
         if chain not in self._http_cache:
@@ -60,6 +62,20 @@ class RpcManager:
             w3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
             self._http_cache[chain] = w3
         return self._http_cache[chain]
+
+    async def get_trade_http(self, chain: str = "bsc") -> AsyncWeb3 | None:
+        """Return a Web3 instance for the trade RPC (MEV protection).
+        Returns None if no trade RPC is configured — caller falls back to regular RPC."""
+        if chain in self._trade_http_cache:
+            return self._trade_http_cache[chain]
+        cfg = await self.get_config(chain)
+        trade_url = (cfg.get("trade_rpc_url") or "").strip()
+        if not trade_url:
+            return None
+        w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(trade_url))
+        w3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+        self._trade_http_cache[chain] = w3
+        return w3
 
     async def get_ws_url(self, chain: str = "bsc") -> str:
         """Return configured WSS URL, falling back to DEFAULT_WS_URL."""

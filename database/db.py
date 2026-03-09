@@ -98,21 +98,80 @@ async def init_db() -> None:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS copy_tasks (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                target_address TEXT  NOT NULL,
-                wallet_id      INTEGER NOT NULL,
-                buy_mode       TEXT  NOT NULL,
-                buy_value      REAL  NOT NULL,
-                sell_mode      TEXT  NOT NULL,
-                slippage       INTEGER NOT NULL DEFAULT 3,
-                gas_multiplier REAL  NOT NULL DEFAULT 1.1,
-                status         TEXT  NOT NULL DEFAULT 'pending',
-                config         TEXT,
-                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_address   TEXT  NOT NULL,
+                wallet_id        INTEGER NOT NULL,
+                buy_mode         TEXT  NOT NULL,
+                buy_value        REAL  NOT NULL,
+                sell_mode        TEXT  NOT NULL,
+                slippage         INTEGER NOT NULL DEFAULT 3,
+                gas_multiplier   REAL  NOT NULL DEFAULT 1.1,
+                status           TEXT  NOT NULL DEFAULT 'pending',
+                config           TEXT,
+                listener_task_id INTEGER,
+                buy_config       TEXT NOT NULL DEFAULT '{}',
+                sell_config      TEXT NOT NULL DEFAULT '{}',
+                created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (wallet_id) REFERENCES wallets(id) ON DELETE CASCADE,
+                FOREIGN KEY (listener_task_id) REFERENCES listener_tasks(id)
             )
             """
         )
+
+        # Migration: add new columns to copy_tasks if they don't exist
+        cur = await db.execute("PRAGMA table_info(copy_tasks)")
+        ct_cols = {row[1] for row in await cur.fetchall()}
+        if "listener_task_id" not in ct_cols:
+            await db.execute(
+                "ALTER TABLE copy_tasks ADD COLUMN listener_task_id INTEGER"
+            )
+        if "buy_config" not in ct_cols:
+            await db.execute(
+                "ALTER TABLE copy_tasks ADD COLUMN buy_config TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "sell_config" not in ct_cols:
+            await db.execute(
+                "ALTER TABLE copy_tasks ADD COLUMN sell_config TEXT NOT NULL DEFAULT '{}'"
+            )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS copy_positions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                copy_task_id    INTEGER NOT NULL,
+                token           TEXT NOT NULL,
+                platform        TEXT NOT NULL,
+                amount_bnb      REAL NOT NULL DEFAULT 0,
+                amount_token    TEXT NOT NULL DEFAULT '0',
+                buy_tx_hash     TEXT,
+                sell_tx_hash    TEXT,
+                sell_amount_bnb REAL,
+                sell_reason     TEXT,
+                profit_bnb      REAL,
+                profit_pct      REAL,
+                status          TEXT NOT NULL DEFAULT 'open',
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sold_at         DATETIME,
+                FOREIGN KEY (copy_task_id) REFERENCES copy_tasks(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        # Migration: add new columns to copy_positions if they don't exist
+        cur = await db.execute("PRAGMA table_info(copy_positions)")
+        cp_cols = {row[1] for row in await cur.fetchall()}
+        for col, typ, default in [
+            ("sell_amount_bnb", "REAL", None),
+            ("sell_reason", "TEXT", None),
+            ("profit_bnb", "REAL", None),
+            ("profit_pct", "REAL", None),
+            ("sold_at", "DATETIME", None),
+        ]:
+            if col not in cp_cols:
+                dflt = f" DEFAULT {default}" if default is not None else ""
+                await db.execute(
+                    f"ALTER TABLE copy_positions ADD COLUMN {col} {typ}{dflt}"
+                )
 
         await db.execute(
             """
@@ -191,6 +250,10 @@ async def init_db() -> None:
         if "is_default" not in rpc_cols:
             await db.execute(
                 "ALTER TABLE rpc_configs ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0"
+            )
+        if "trade_rpc_url" not in rpc_cols:
+            await db.execute(
+                "ALTER TABLE rpc_configs ADD COLUMN trade_rpc_url TEXT DEFAULT ''"
             )
 
         await db.execute(

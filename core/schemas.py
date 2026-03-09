@@ -37,15 +37,20 @@ class ListenerTaskRenameRequest(BaseModel):
     label: str = Field(min_length=1, max_length=64)
 
 
+class SmartCondition(BaseModel):
+    min_bnb: float = Field(gt=0)
+    amount: float = Field(gt=0)
+
+
 class CopyTaskCreateRequest(BaseModel):
-    target_address: str
+    listener_task_id: int = Field(ge=1)
     wallet_id: int = Field(ge=1)
-    buy_mode: Literal["fixed", "ratio"]
-    buy_value: float = Field(gt=0)
-    sell_mode: Literal["mirror", "custom"]
-    slippage: int = Field(default=3, ge=1, le=99)
-    gas_multiplier: float = Field(default=1.1, ge=1.0, le=3.0)
-    config: dict = Field(default_factory=dict)
+    buy_mode: Literal["fixed", "smart"]
+    buy_config: dict = Field(default_factory=dict)
+    sell_mode: Literal["copy_sell", "tp_sl", "both"]
+    sell_config: dict = Field(default_factory=dict)
+    slippage: int = Field(default=10, ge=1, le=99)
+    gas_multiplier: float = Field(default=1.2, ge=1.0, le=3.0)
 
 
 class StrategyTaskCreateRequest(BaseModel):

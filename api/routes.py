@@ -33,6 +33,7 @@ from utils.runtime import RuntimeManager
 from wallet.service import WalletService
 
 # Lazy imports to avoid circular deps — engines are passed in at build time
+from copytrade.engine import CopyTradeEngine
 from listener.engine import ListenerEngine
 from strategy.engine import StrategyEngine
 
@@ -43,6 +44,7 @@ def build_router(
     rpc_manager: RpcManager,
     runtime: RuntimeManager,
     listener_engine: ListenerEngine,
+    copy_engine: CopyTradeEngine,
     strategy_engine: StrategyEngine,
 ) -> APIRouter:
     router = APIRouter()
@@ -73,6 +75,11 @@ def build_router(
                 "SELECT COUNT(1) FROM listener_tasks WHERE status = 'running'"
             )
             stats["active_listeners"] = (await cur.fetchone())[0]
+
+            cur = await db.execute(
+                "SELECT COUNT(1) FROM copy_tasks WHERE status = 'running'"
+            )
+            stats["active_copies"] = (await cur.fetchone())[0]
             return stats
 
     @router.get("/api/listener-tasks/{task_id}")
@@ -145,6 +152,12 @@ def build_router(
         if not row:
             raise HTTPException(status_code=404, detail="wallet not found")
         balance = await wallet_service.get_wallet_balance(row["address"])
+        return {"balance": balance}
+
+    @router.get("/api/wallet-balance")
+    async def address_balance(address: str = Query(...)):
+        """BNB balance for any address."""
+        balance = await wallet_service.get_wallet_balance(address)
         return {"balance": balance}
 
     @router.patch("/api/wallets/{wallet_id}/name")
@@ -332,11 +345,8 @@ def build_router(
             if row["status"] == "running":
                 raise HTTPException(status_code=400, detail="stop the listener before deleting")
 
-            # TODO: check copy_tasks linked to this listener's target_address
-            # For now copy trade is not functional, but block delete if linked
             cur2 = await db.execute(
-                "SELECT COUNT(1) FROM copy_tasks WHERE target_address = "
-                "(SELECT target_address FROM listener_tasks WHERE id = ?)",
+                "SELECT COUNT(1) FROM copy_tasks WHERE listener_task_id = ?",
                 (task_id,),
             )
             if (await cur2.fetchone())[0] > 0:
@@ -364,58 +374,196 @@ def build_router(
 
     @router.post("/api/copy-tasks")
     async def create_copy_task(payload: CopyTaskCreateRequest):
-        target = wallet_service.validate_evm_address(payload.target_address)
-        if not target:
-            raise HTTPException(status_code=400, detail="invalid target_address")
+        # Validate listener task exists
+        lt = await fetch_one(
+            "SELECT id, target_address FROM listener_tasks WHERE id = ?",
+            (payload.listener_task_id,),
+        )
+        if not lt:
+            raise HTTPException(status_code=404, detail="listener task not found")
 
+        # Validate wallet exists
+        w = await fetch_one("SELECT id FROM wallets WHERE id = ?", (payload.wallet_id,))
+        if not w:
+            raise HTTPException(status_code=404, detail="wallet not found")
+
+        # One wallet can only have one active copy task
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
-                """
-                INSERT INTO copy_tasks
-                (target_address, wallet_id, buy_mode, buy_value, sell_mode,
-                 slippage, gas_multiplier, status, config)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                """,
+                "SELECT id FROM copy_tasks WHERE wallet_id = ? AND status != 'deleted'",
+                (payload.wallet_id,),
+            )
+            if await cur.fetchone():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"wallet #{payload.wallet_id} already has a copy task",
+                )
+
+            # Derive buy_value for backward compat (use first condition or fixed amount)
+            if payload.buy_mode == "fixed":
+                buy_value = payload.buy_config.get("amount", 0.1)
+            else:
+                conds = payload.buy_config.get("conditions", [])
+                buy_value = conds[0]["amount"] if conds else 0.1
+
+            cur = await db.execute(
+                """INSERT INTO copy_tasks
+                   (target_address, wallet_id, listener_task_id,
+                    buy_mode, buy_value, buy_config,
+                    sell_mode, sell_config,
+                    slippage, gas_multiplier, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
-                    target,
+                    lt["target_address"],
                     payload.wallet_id,
+                    payload.listener_task_id,
                     payload.buy_mode,
-                    payload.buy_value,
+                    buy_value,
+                    json.dumps(payload.buy_config),
                     payload.sell_mode,
+                    json.dumps(payload.sell_config),
                     payload.slippage,
                     payload.gas_multiplier,
-                    json.dumps(payload.config),
                 ),
             )
             await db.commit()
             task_id = cur.lastrowid
 
         await log_service.push(
-            f"copy task #{task_id} created for wallet #{payload.wallet_id}",
-            "SUCCESS",
-            "copytrade",
+            f"copy task #{task_id} created — wallet #{payload.wallet_id} ← "
+            f"listener #{payload.listener_task_id}",
+            "SUCCESS", "copytrade",
         )
         return {"status": "ok", "id": task_id}
 
     @router.get("/api/copy-tasks")
     async def list_copy_tasks():
-        return await fetch_all("SELECT * FROM copy_tasks ORDER BY id DESC")
+        return await fetch_all(
+            """SELECT ct.*,
+                      lt.label AS listener_label,
+                      w.label AS wallet_label, w.address AS wallet_address
+               FROM copy_tasks ct
+               LEFT JOIN listener_tasks lt ON ct.listener_task_id = lt.id
+               LEFT JOIN wallets w ON ct.wallet_id = w.id
+               ORDER BY ct.id DESC"""
+        )
 
     @router.patch("/api/copy-tasks/{task_id}/status")
     async def update_copy_status(task_id: int, payload: TaskStatusUpdateRequest):
+        row = await fetch_one("SELECT * FROM copy_tasks WHERE id = ?", (task_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+
+        # When starting, verify linked listener is running
+        if payload.status == "running":
+            lt = await fetch_one(
+                "SELECT status FROM listener_tasks WHERE id = ?",
+                (row["listener_task_id"],),
+            )
+            if not lt or lt["status"] != "running":
+                raise HTTPException(
+                    status_code=400,
+                    detail="linked listener must be running first",
+                )
+
         async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
+            await db.execute(
                 "UPDATE copy_tasks SET status = ? WHERE id = ?",
                 (payload.status, task_id),
             )
             await db.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="task not found")
+
+        key = f"copy:{task_id}"
+        if payload.status == "running":
+            runtime.start_job(key, lambda tid=task_id: copy_engine.run_copy_task(tid))
+            await log_service.push(
+                f"copy task #{task_id} started", "INFO", "copytrade",
+            )
+        elif payload.status in {"paused", "interrupted", "pending"}:
+            await runtime.stop_job(key)
+
+        return {"status": "ok", "task_id": task_id, "new_status": payload.status}
+
+    @router.delete("/api/copy-tasks/{task_id}")
+    async def delete_copy_task(task_id: int):
+        row = await fetch_one(
+            "SELECT id, status FROM copy_tasks WHERE id = ?", (task_id,),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="task not found")
+        if row["status"] == "running":
+            raise HTTPException(status_code=400, detail="stop the task before deleting")
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM copy_positions WHERE copy_task_id = ?", (task_id,),
+            )
+            await db.execute("DELETE FROM copy_tasks WHERE id = ?", (task_id,))
+            await db.commit()
 
         await log_service.push(
-            f"copy task #{task_id} → {payload.status}", "INFO", "copytrade"
+            f"copy task #{task_id} deleted", "WARNING", "copytrade",
         )
-        return {"status": "ok", "task_id": task_id, "new_status": payload.status}
+        return {"status": "ok"}
+
+    @router.get("/api/copy-tasks/{task_id}/positions")
+    async def copy_task_positions(task_id: int):
+        return await fetch_all(
+            "SELECT * FROM copy_positions WHERE copy_task_id = ? ORDER BY id DESC",
+            (task_id,),
+        )
+
+    @router.get("/api/copy-tasks/{task_id}/records")
+    async def copy_task_records(task_id: int):
+        """Return buy/sell transaction records for a copy task, with P&L from positions."""
+        return await fetch_all(
+            """SELECT t.*,
+                      cp.id AS position_id,
+                      cp.status AS position_status,
+                      cp.profit_bnb AS pos_profit_bnb,
+                      cp.profit_pct AS pos_profit_pct,
+                      cp.amount_bnb AS pos_entry_bnb,
+                      cp.sell_amount_bnb AS pos_sell_bnb,
+                      cp.sell_reason AS pos_sell_reason
+               FROM transactions t
+               LEFT JOIN copy_positions cp ON cp.copy_task_id = t.source_task_id AND (
+                   (t.action = 'buy' AND cp.buy_tx_hash = t.tx_hash) OR
+                   (t.action = 'sell' AND cp.sell_tx_hash = t.tx_hash)
+               )
+               WHERE t.source_task_id = ? AND t.source_task_type = 'copy'
+               ORDER BY t.id DESC
+               LIMIT 200""",
+            (task_id,),
+        )
+
+    @router.post("/api/copy-positions/{position_id}/sell")
+    async def manual_sell_position(position_id: int, payload: dict = {}):
+        """Manually sell an open copy trade position."""
+        slippage = payload.get("slippage", 5) if payload else 5
+        try:
+            result = await copy_engine.manual_sell(position_id, slippage=slippage)
+            return {"status": "ok", **result}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.get("/api/copy-positions")
+    async def all_copy_positions():
+        return await fetch_all(
+            """SELECT cp.*,
+                      ct.listener_task_id,
+                      lt.label AS listener_label,
+                      lt.target_address,
+                      w.label AS wallet_label,
+                      w.address AS wallet_address
+               FROM copy_positions cp
+               JOIN copy_tasks ct ON cp.copy_task_id = ct.id
+               LEFT JOIN listener_tasks lt ON ct.listener_task_id = lt.id
+               LEFT JOIN wallets w ON ct.wallet_id = w.id
+               ORDER BY cp.id DESC
+               LIMIT 200"""
+        )
 
     # ------------------------------------------------------------------
     # Strategy tasks
@@ -598,6 +746,26 @@ def build_router(
             runtime.start_job(key, lambda tid=t["id"]: listener_engine.run_listener_task(tid))
         await log_service.push(
             f"RPC switched to config #{config_id}, restarted {len(running_listeners)} listener(s)",
+            "INFO", "system",
+        )
+        return {"status": "ok"}
+
+    @router.patch("/api/rpc-configs/{config_id}/trade-rpc")
+    async def set_trade_rpc(config_id: int, payload: dict):
+        """Set a dedicated trade RPC URL (MEV protection) for an RPC config."""
+        trade_url = (payload.get("trade_rpc_url") or "").strip()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "UPDATE rpc_configs SET trade_rpc_url = ? WHERE id = ?",
+                (trade_url, config_id),
+            )
+            await db.commit()
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="RPC config not found")
+        rpc_manager.invalidate()
+        label = trade_url[:40] + "..." if len(trade_url) > 40 else trade_url
+        await log_service.push(
+            f"Trade RPC {'set to ' + label if trade_url else 'cleared'} on config #{config_id}",
             "INFO", "system",
         )
         return {"status": "ok"}

@@ -351,7 +351,7 @@
         <div class="tab" :class="{ active: page==='dashboard' }" @click="page='dashboard'">Dashboard</div>
         <div class="tab" :class="{ active: page==='wallets'   }" @click="page='wallets';loadWallets()">Wallets</div>
         <div class="tab" :class="{ active: page==='listener'  }" @click="page='listener';loadListenerTasks()">Listener</div>
-        <div class="tab" :class="{ active: page==='copy'      }" @click="page='copy';loadCopyTasks()">Copy Trade</div>
+        <div class="tab" :class="{ active: page==='copy'      }" @click="page='copy';loadCopyTasks();loadWallets();loadListenerTasks()">Copy Trade</div>
         <div class="tab" :class="{ active: page==='rpc'       }" @click="page='rpc';loadRpcConfigs()">RPC</div>
     </nav>
 
@@ -367,7 +367,7 @@
                     <div class="stat"><div class="stat-k">Wallets</div><div class="stat-v">{{ stats.wallets||0 }}</div></div>
                     <div class="stat"><div class="stat-k">Listeners</div><div class="stat-v">{{ stats.listener_tasks||0 }}</div></div>
                     <div class="stat"><div class="stat-k">Copy Tasks</div><div class="stat-v">{{ stats.copy_tasks||0 }}</div></div>
-                    <div class="stat"><div class="stat-k">Strategies</div><div class="stat-v">{{ stats.strategy_tasks||0 }}</div></div>
+                    <div class="stat"><div class="stat-k">Active Copies</div><div class="stat-v" style="color:var(--c2)">{{ stats.active_copies||0 }}</div></div>
                     <div class="stat"><div class="stat-k">Transactions</div><div class="stat-v">{{ stats.transactions||0 }}</div></div>
                     <div class="stat"><div class="stat-k">Active Listeners</div><div class="stat-v" style="color:var(--c1)">{{ stats.active_listeners||0 }}</div></div>
                 </div>
@@ -861,42 +861,118 @@
             <div class="card-head">New Copy Trade Task</div>
             <div class="card-body">
                 <div class="form">
+                    <!-- Listener selector -->
                     <div class="field">
-                        <label>Target Address</label>
-                        <input v-model="copyForm.target_address" placeholder="0x...">
+                        <label>Source Listener</label>
+                        <select v-model.number="copyForm.listener_task_id"
+                                @change="fetchCopyListenerTarget()">
+                            <option :value="null" disabled>Select listener...</option>
+                            <option v-for="lt in listenerTasks" :key="lt.id" :value="lt.id">
+                                #{{ lt.id }} {{ lt.label || shortAddr(lt.target_address) }}
+                                <template v-if="lt.status==='running'"> ● </template>
+                            </option>
+                        </select>
+                        <div v-if="copyTargetBal!==null" style="margin-top:4px;font-size:11px;color:var(--muted)">
+                            Target {{ shortAddr(copyTargetAddr) }}:
+                            <span v-if="copyTargetBal==='loading'" style="opacity:.5">loading...</span>
+                            <span v-else-if="copyTargetBal==='error'" style="color:var(--c3)">error</span>
+                            <span v-else style="color:var(--c2);font-weight:600">
+                                {{ parseFloat(copyTargetBal).toFixed(4) }} BNB
+                            </span>
+                        </div>
                     </div>
+
+                    <!-- Wallet selector -->
                     <div class="field">
-                        <label>Wallet ID</label>
-                        <input v-model.number="copyForm.wallet_id" type="number" min="1" placeholder="1">
+                        <label>Wallet</label>
+                        <select v-model.number="copyForm.wallet_id"
+                                @change="fetchCopyWalletBal()">
+                            <option :value="null" disabled>Select wallet...</option>
+                            <option v-for="w in wallets" :key="w.id" :value="w.id">
+                                #{{ w.id }} {{ w.label || shortAddr(w.address) }}
+                            </option>
+                        </select>
+                        <div v-if="copyWalletBal!==null" style="margin-top:4px;font-size:11px;color:var(--muted)">
+                            Balance:
+                            <span v-if="copyWalletBal==='loading'" style="opacity:.5">loading...</span>
+                            <span v-else-if="copyWalletBal==='error'" style="color:var(--c3)">error</span>
+                            <span v-else style="color:var(--c1);font-weight:600">
+                                {{ parseFloat(copyWalletBal).toFixed(4) }} BNB
+                            </span>
+                        </div>
                     </div>
+
+                    <!-- Buy mode -->
                     <div class="field">
                         <label>Buy Mode</label>
                         <select v-model="copyForm.buy_mode">
                             <option value="fixed">Fixed Amount</option>
-                            <option value="ratio">Ratio</option>
+                            <option value="smart">Smart Copy</option>
                         </select>
                     </div>
-                    <div class="field">
-                        <label>Buy Value (BNB or ratio)</label>
-                        <input v-model.number="copyForm.buy_value" type="number" min="0.0001" step="0.01" placeholder="0.2">
+
+                    <!-- Fixed: single amount -->
+                    <div class="field" v-if="copyForm.buy_mode==='fixed'">
+                        <label>Buy Amount (BNB)</label>
+                        <input v-model.number="copyForm.fixedAmount" type="number" min="0.001" step="0.01" placeholder="0.1">
                     </div>
+
+                    <!-- Smart: up to 3 conditions -->
+                    <div v-if="copyForm.buy_mode==='smart'" style="grid-column:1/-1">
+                        <label style="margin-bottom:6px;display:block;font-size:11px;color:var(--muted)">
+                            Smart Conditions (buy X BNB when target buys &gt; Y BNB)
+                        </label>
+                        <div v-for="(c,i) in copyForm.conditions" :key="i"
+                             style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+                            <span style="font-size:11px;color:var(--muted);min-width:50px">When &gt;</span>
+                            <input v-model.number="c.min_bnb" type="number" min="0" step="0.1"
+                                   placeholder="Target BNB" style="width:120px">
+                            <span style="font-size:11px;color:var(--muted)">BNB → buy</span>
+                            <input v-model.number="c.amount" type="number" min="0.001" step="0.01"
+                                   placeholder="Amount" style="width:120px">
+                            <span style="font-size:11px;color:var(--muted)">BNB</span>
+                            <button v-if="copyForm.conditions.length>1" class="btn btn-warn"
+                                    style="padding:2px 8px;font-size:11px"
+                                    @click="copyForm.conditions.splice(i,1)">×</button>
+                        </div>
+                        <button v-if="copyForm.conditions.length<3" class="btn btn-alt"
+                                style="font-size:11px;padding:3px 10px"
+                                @click="copyForm.conditions.push({min_bnb:0,amount:0.01})">+ Add Condition</button>
+                    </div>
+
+                    <!-- Sell mode -->
                     <div class="field">
                         <label>Sell Mode</label>
                         <select v-model="copyForm.sell_mode">
-                            <option value="mirror">Mirror</option>
-                            <option value="custom">Custom (Strategy Engine)</option>
+                            <option value="both">Follow + TP/SL (recommended)</option>
+                            <option value="copy_sell">Follow Sell Only</option>
+                            <option value="tp_sl">TP/SL Only</option>
                         </select>
                     </div>
+
+                    <!-- TP/SL config -->
+                    <template v-if="copyForm.sell_mode==='tp_sl' || copyForm.sell_mode==='both'">
+                        <div class="field">
+                            <label>Take Profit (%)</label>
+                            <input v-model.number="copyForm.takeProfit" type="number" min="1" max="10000" placeholder="50">
+                        </div>
+                        <div class="field">
+                            <label>Stop Loss (%)</label>
+                            <input v-model.number="copyForm.stopLoss" type="number" min="1" max="100" placeholder="20">
+                        </div>
+                    </template>
+
                     <div class="field">
                         <label>Slippage (%)</label>
-                        <input v-model.number="copyForm.slippage" type="number" min="1" max="99" placeholder="3">
+                        <input v-model.number="copyForm.slippage" type="number" min="1" max="99" placeholder="5">
                     </div>
                     <div class="field">
                         <label>Gas Multiplier</label>
-                        <input v-model.number="copyForm.gas_multiplier" type="number" min="1" max="3" step="0.1" placeholder="1.1">
+                        <input v-model.number="copyForm.gas_multiplier" type="number" min="1" max="3" step="0.1" placeholder="1.2">
                     </div>
                     <div class="field" style="align-self:end">
-                        <button class="btn btn-primary" @click="createCopyTask">Create Task</button>
+                        <button class="btn btn-primary" @click="createCopyTask"
+                                :disabled="!copyForm.listener_task_id || !copyForm.wallet_id">Create Task</button>
                     </div>
                 </div>
             </div>
@@ -913,27 +989,154 @@
             </div>
             <div class="card-body">
                 <table>
-                    <thead><tr><th>ID</th><th>Target</th><th>Wallet</th><th>Buy</th><th>Sell</th><th>Slippage</th><th>Gas</th><th>Status</th><th>Actions</th></tr></thead>
+                    <thead><tr>
+                        <th>ID</th><th>Listener</th><th>Wallet</th>
+                        <th>Buy</th><th>Sell</th><th>Slippage</th>
+                        <th>Status</th><th>Actions</th>
+                    </tr></thead>
                     <tbody>
-                        <tr v-for="t in copyTasks" :key="t.id">
-                            <td>{{ t.id }}</td>
-                            <td class="mono">{{ shortAddr(t.target_address) }}</td>
-                            <td>#{{ t.wallet_id }}</td>
-                            <td>{{ t.buy_mode }}/{{ t.buy_value }}</td>
-                            <td>{{ t.sell_mode }}</td>
+                        <tr v-for="t in copyTasks" :key="t.id"
+                            class="task-row-clickable"
+                            :class="{ 'task-row-active': selectedCopyTask && selectedCopyTask.id===t.id }"
+                            @click="openCopyDetail(t)">
+                            <td class="muted">#{{ t.id }}</td>
+                            <td>
+                                <span style="font-size:11px;opacity:.6">#{{ t.listener_task_id }}</span>
+                                {{ t.listener_label || shortAddr(t.target_address) }}
+                            </td>
+                            <td>
+                                <span style="font-size:11px;opacity:.6">#{{ t.wallet_id }}</span>
+                                {{ t.wallet_label || shortAddr(t.wallet_address) }}
+                            </td>
+                            <td>
+                                <span class="badge" style="font-size:10px">{{ t.buy_mode }}</span>
+                                <span style="font-size:11px">{{ fmtBuyConfig(t) }}</span>
+                            </td>
+                            <td>
+                                <span style="font-size:11px">{{ fmtSellConfig(t) }}</span>
+                            </td>
                             <td>{{ t.slippage }}%</td>
-                            <td>{{ t.gas_multiplier }}x</td>
                             <td><span class="badge" :class="'badge-'+t.status">{{ t.status }}</span></td>
                             <td>
                                 <div class="btn-row">
-                                    <button class="btn btn-alt"  @click="setTaskStatus('copy',t.id,'running')">Start</button>
-                                    <button class="btn btn-warn" @click="setTaskStatus('copy',t.id,'paused')">Pause</button>
+                                    <button class="btn btn-alt" @click="setTaskStatus('copy',t.id,'running')"
+                                            :disabled="t.status==='running'">Start</button>
+                                    <button class="btn btn-warn" @click="setTaskStatus('copy',t.id,'paused')"
+                                            :disabled="t.status!=='running'">Pause</button>
+                                    <button class="btn btn-warn" @click="deleteCopyTask(t)"
+                                            :disabled="t.status==='running'" title="Delete"
+                                            style="padding:2px 8px">🗑</button>
                                 </div>
                             </td>
                         </tr>
-                        <tr v-if="!copyTasks.length"><td colspan="9" class="muted" style="text-align:center;padding:16px">No tasks yet</td></tr>
+                        <tr v-if="!copyTasks.length"><td colspan="8" class="muted" style="text-align:center;padding:16px">No tasks yet</td></tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- ── Copy task detail panel (shown when a task row is clicked) ── -->
+        <div v-if="selectedCopyTask" class="card detail-panel">
+            <div class="card-head">
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                    <span v-if="selectedCopyTask.status==='running'">
+                        <span class="detail-live-dot"></span>
+                    </span>
+                    <span style="font-size:13px">
+                        #{{ selectedCopyTask.id }}
+                        <span class="muted" style="font-size:11px;margin:0 4px">→</span>
+                        <span style="color:var(--c2);font-weight:700">
+                            {{ selectedCopyTask.listener_label || shortAddr(selectedCopyTask.target_address) }}
+                        </span>
+                    </span>
+                    <span class="badge" :class="'badge-'+selectedCopyTask.status">
+                        {{ selectedCopyTask.status }}
+                    </span>
+                    <span class="muted" style="font-size:11px">
+                        {{ copyRecords.length }} record{{ copyRecords.length!==1?'s':'' }}
+                    </span>
+                </div>
+                <div class="btn-row">
+                    <button class="btn btn-alt" style="font-size:11px" @click="loadCopyRecords(selectedCopyTask.id)">Refresh</button>
+                    <button class="btn btn-alt" style="font-size:11px" @click="closeCopyDetail">Close</button>
+                </div>
+            </div>
+            <div class="card-body" style="padding:0">
+                <!-- records header -->
+                <div style="display:grid;grid-template-columns:56px 60px minmax(60px,auto) 110px 55px 130px 90px;gap:6px;padding:8px 14px;border-bottom:1px solid var(--line);align-items:center">
+                    <span class="muted" style="font-size:10px;font-weight:600">Time</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">Platform</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">Token</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">Amount</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">Type</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">P&L</span>
+                    <span class="muted" style="font-size:10px;font-weight:600">Tx</span>
+                </div>
+                <div class="log-box" style="max-height:400px;border-radius:0;border:none;padding:0">
+                    <div v-if="copyRecordsLoading" style="text-align:center;padding:24px;color:var(--muted);font-size:12px">
+                        Loading...
+                    </div>
+                    <div v-else-if="!copyRecords.length" style="text-align:center;padding:24px;color:var(--muted);font-size:12px">
+                        No records yet{{ selectedCopyTask.status==='running' ? ' — waiting for trades...' : '' }}
+                    </div>
+                    <div v-else>
+                        <div v-for="r in copyRecords" :key="r.id" class="event-row"
+                             style="padding:6px 14px;grid-template-columns:56px 60px minmax(60px,auto) 110px 55px 130px 90px;align-items:center;gap:6px">
+                            <!-- Time -->
+                            <span class="muted" style="font-size:10px;white-space:nowrap;cursor:help" :title="fmtTime(r.created_at)">
+                                {{ fmtTimeShort(r.created_at) }}
+                            </span>
+                            <!-- Platform -->
+                            <span class="badge" style="font-size:10px" :style="platformStyle(r.platform)">{{ r.platform }}</span>
+                            <!-- Token -->
+                            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+                                <span class="token-link" @click.stop="copyText(r.token)" :title="r.token" style="font-size:11px">
+                                    ${{ tokenSymbol(r.token) }}
+                                </span>
+                                <span v-if="r.amount_token && r.amount_token!=='0'" class="muted" style="font-size:9px;margin-left:3px">
+                                    {{ fmtTokenAmt(r.amount_token) }}
+                                </span>
+                            </span>
+                            <!-- Amount BNB -->
+                            <span class="quote-token" style="font-size:11px;white-space:nowrap">
+                                {{ fmtBnbUsd(r.amount) }}
+                            </span>
+                            <!-- Type: BUY / SELL reason -->
+                            <span>
+                                <span v-if="r.action==='buy'" class="badge" style="font-size:9px;border-color:rgba(31,216,200,.3);color:var(--c1)">BUY</span>
+                                <span v-else-if="r.action==='sell'" class="badge" style="font-size:9px"
+                                      :style="reasonStyle(r.pos_sell_reason || recordExtra(r).reason || 'follow')">
+                                    {{ reasonLabel(r.pos_sell_reason || recordExtra(r).reason || 'follow') }}
+                                </span>
+                                <span v-else class="badge" style="font-size:9px">{{ r.action }}</span>
+                            </span>
+                            <!-- P&L / Sell button -->
+                            <span style="white-space:nowrap;font-size:11px;overflow:hidden;text-overflow:ellipsis">
+                                <template v-if="r.action==='sell' && (r.pos_profit_bnb!=null || recordExtra(r).profit_bnb!=null)">
+                                    <span :style="{color: (r.pos_profit_bnb ?? recordExtra(r).profit_bnb) >= 0 ? 'var(--c1)' : 'var(--c3)', fontWeight:600}">
+                                        {{ (r.pos_profit_bnb ?? recordExtra(r).profit_bnb) >= 0 ? '+' : '' }}{{ (r.pos_profit_bnb ?? recordExtra(r).profit_bnb).toFixed(4) }}
+                                        <span style="font-size:9px;opacity:.7">
+                                            ({{ (r.pos_profit_pct ?? recordExtra(r).profit_pct) >= 0 ? '+' : '' }}{{ (r.pos_profit_pct ?? recordExtra(r).profit_pct)?.toFixed(1) }}%)
+                                        </span>
+                                    </span>
+                                </template>
+                                <template v-else-if="r.action==='buy' && r.position_status==='open'">
+                                    <button class="btn btn-warn" style="font-size:10px;padding:2px 8px"
+                                            @click.stop="manualSellPosition(r)">Sell</button>
+                                </template>
+                                <span v-else class="muted" style="font-size:10px">—</span>
+                            </span>
+                            <!-- Tx hash -->
+                            <span style="font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
+                                <a v-if="r.tx_hash" :href="'https://bscscan.com/tx/'+r.tx_hash" target="_blank"
+                                   @click.stop :style="{color: r.action==='buy' ? 'var(--c1)' : 'var(--c3)', textDecoration:'none'}"
+                                   :title="r.tx_hash">
+                                    {{ r.tx_hash.slice(0,8) }}…
+                                </a>
+                            </span>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -970,7 +1173,7 @@
             </div>
             <div class="card-body">
                 <table>
-                    <thead><tr><th>Nickname</th><th>HTTP RPC</th><th>WebSocket</th><th>Chain</th><th>Status</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>Nickname</th><th>HTTP RPC</th><th>Trade RPC (MEV)</th><th>Chain</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody>
                         <tr v-for="r in rpcConfigs" :key="r.id"
                             :style="r.active ? 'background:rgba(31,216,200,.04)' : ''">
@@ -978,8 +1181,16 @@
                                 <span>{{ r.label || '-' }}</span>
                                 <span v-if="r.is_default" class="badge" style="margin-left:4px;font-size:9px;color:var(--muted);border-color:var(--line)">built-in</span>
                             </td>
-                            <td class="mono" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="r.rpc_url">{{ r.rpc_url }}</td>
-                            <td class="mono muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="r.ws_url || (r.is_default ? 'wss://bsc.drpc.org (default)' : '')">{{ r.ws_url || (r.is_default ? 'wss://bsc.drpc.org' : '-') }}</td>
+                            <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="r.rpc_url">{{ r.rpc_url }}</td>
+                            <td style="max-width:240px">
+                                <div v-if="r.active" style="display:flex;gap:4px;align-items:center">
+                                    <input v-model="r._tradeRpc" :placeholder="'e.g. https://rpc-bsc.48.club'"
+                                           style="font-size:11px;padding:4px 6px;flex:1;min-width:0" @keyup.enter="saveTradeRpc(r)">
+                                    <button class="btn btn-alt" style="font-size:10px;padding:3px 8px;white-space:nowrap" @click="saveTradeRpc(r)">Save</button>
+                                </div>
+                                <span v-else class="mono muted" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"
+                                      :title="r.trade_rpc_url">{{ r.trade_rpc_url || '-' }}</span>
+                            </td>
                             <td class="muted">{{ r.chain }}</td>
                             <td>
                                 <span v-if="r.active" class="badge badge-running" style="font-weight:700">Using</span>

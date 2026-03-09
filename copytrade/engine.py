@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 TPSL_CHECK_INTERVAL = 15  # seconds
 
 # Retry settings
-BUY_SLIPPAGE_TIERS = [5, 10, 10, 15, 20]  # escalating slippage per attempt
+BUY_SLIPPAGE_TIERS = [10, 15, 20, 15, 20]  # escalating slippage per attempt
 BUY_MAX_RETRIES = len(BUY_SLIPPAGE_TIERS)
-SELL_SLIPPAGE_TIERS = [5, 10, 15, 20, 20]  # for sell retries
+SELL_SLIPPAGE_TIERS = [10, 15, 15, 20, 20]  # for sell retries
 SELL_MAX_RETRIES = 50  # effectively unlimited — sell until success
 RETRY_BASE_DELAY = 2  # seconds
 

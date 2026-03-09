@@ -14,6 +14,8 @@ from web3 import AsyncWeb3
 
 from core.constants import (
     PANCAKESWAP_ROUTER,
+    PANCAKESWAP_V3_QUOTER,
+    PANCAKESWAP_V3_ROUTER,
     PLATFORM_CONTRACTS,
     WBNB_ADDRESS,
 )
@@ -159,6 +161,95 @@ _PCS_ROUTER_ABI = [
     },
 ]
 
+# ── PancakeSwap V3 SmartRouter ABI (subset) ───────────────────────────
+
+_PCS_V3_ROUTER_ABI = [
+    {
+        "name": "exactInputSingle",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [{
+            "name": "params",
+            "type": "tuple",
+            "components": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "fee", "type": "uint24"},
+                {"name": "recipient", "type": "address"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "amountOutMinimum", "type": "uint256"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+        }],
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+    },
+    {
+        "name": "multicall",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "deadline", "type": "uint256"},
+            {"name": "data", "type": "bytes[]"},
+        ],
+        "outputs": [{"name": "results", "type": "bytes[]"}],
+    },
+    {
+        "name": "unwrapWETH9",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "amountMinimum", "type": "uint256"},
+            {"name": "recipient", "type": "address"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "swapExactTokensForTokens",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "amountOutMin", "type": "uint256"},
+            {"name": "path", "type": "address[]"},
+            {"name": "to", "type": "address"},
+        ],
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+    },
+]
+
+# ── PancakeSwap V3 QuoterV2 ABI (subset) ─────────────────────────────
+
+_PCS_V3_QUOTER_ABI = [
+    {
+        "name": "quoteExactInputSingle",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{
+            "name": "params",
+            "type": "tuple",
+            "components": [
+                {"name": "tokenIn", "type": "address"},
+                {"name": "tokenOut", "type": "address"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "fee", "type": "uint24"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+        }],
+        "outputs": [
+            {"name": "amountOut", "type": "uint256"},
+            {"name": "sqrtPriceX96After", "type": "uint160"},
+            {"name": "initializedTicksCrossed", "type": "uint32"},
+            {"name": "gasEstimate", "type": "uint256"},
+        ],
+    },
+]
+
+# V3 fee tiers to try (most common on BSC first)
+V3_FEE_TIERS = [2500, 10000, 500, 100]
+
+# PCS V3 SmartRouter "address(this)" convention for intermediate swaps
+_ADDRESS_THIS = "0x0000000000000000000000000000000000000002"
+
 _ERC20_ABI = [
     {
         "name": "approve",
@@ -224,7 +315,7 @@ class TradeRouter:
         token: str,
         amount_bnb_wei: int,
         private_key: str,
-        slippage: int = 5,
+        slippage: int = 10,
         gas_multiplier: float = 1.2,
         chain: str = "bsc",
     ) -> dict:
@@ -349,7 +440,7 @@ class TradeRouter:
         token: str,
         amount_token_raw: int,
         private_key: str,
-        slippage: int = 5,
+        slippage: int = 10,
         gas_multiplier: float = 1.2,
         chain: str = "bsc",
     ) -> dict:

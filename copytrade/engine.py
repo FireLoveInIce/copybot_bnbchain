@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 TPSL_CHECK_INTERVAL = 15  # seconds
 
 # Retry settings
-BUY_MAX_RETRIES = 5
+BUY_SLIPPAGE_TIERS = [5, 10, 10, 15, 20]  # escalating slippage per attempt
+BUY_MAX_RETRIES = len(BUY_SLIPPAGE_TIERS)
+SELL_SLIPPAGE_TIERS = [5, 10, 15, 20, 20]  # for sell retries
 SELL_MAX_RETRIES = 50  # effectively unlimited — sell until success
 RETRY_BASE_DELAY = 2  # seconds
 
@@ -193,12 +195,13 @@ class CopyTradeEngine:
             )
             return
 
-        # Retry loop — max BUY_MAX_RETRIES attempts
+        # Retry loop with escalating slippage: 5→10→10→15→20
         for attempt in range(1, BUY_MAX_RETRIES + 1):
+            slippage = BUY_SLIPPAGE_TIERS[attempt - 1]
             try:
                 await self.log.push(
                     f"copy #{task_id}: BUY attempt {attempt}/{BUY_MAX_RETRIES} "
-                    f"{amount_bnb:.4f} BNB → {token[:10]}... on {platform}",
+                    f"{amount_bnb:.4f} BNB → {token[:10]}... on {platform} (slippage {slippage}%)",
                     "INFO", "copytrade",
                 )
 
@@ -207,7 +210,7 @@ class CopyTradeEngine:
                     token=token,
                     amount_bnb_wei=amount_wei,
                     private_key=wallet["private_key"],
-                    slippage=task["slippage"],
+                    slippage=slippage,
                     gas_multiplier=task["gas_multiplier"],
                     chain=task.get("chain", "bsc"),
                 )
@@ -312,12 +315,13 @@ class CopyTradeEngine:
                         f"{token[:10]}... on {plat}",
                         "INFO", "copytrade",
                     )
+                    sell_slippage = SELL_SLIPPAGE_TIERS[min(attempt - 1, len(SELL_SLIPPAGE_TIERS) - 1)]
                     result = await self.router.sell(
                         platform=plat,
                         token=token,
                         amount_token_raw=balance,
                         private_key=wallet["private_key"],
-                        slippage=task["slippage"],
+                        slippage=sell_slippage,
                         gas_multiplier=task["gas_multiplier"],
                         chain=chain,
                     )
@@ -397,13 +401,26 @@ class CopyTradeEngine:
             await asyncio.sleep(TPSL_CHECK_INTERVAL)
             try:
                 positions = await self._open_positions(task_id)
+
+                # Group positions by token to avoid double-counting
+                tokens_seen: dict[str, dict] = {}
                 for pos in positions:
-                    token = pos["token"]
-                    entry_bnb = pos["amount_bnb"]
-                    if entry_bnb <= 0:
+                    tk = pos["token"].lower()
+                    if tk not in tokens_seen:
+                        tokens_seen[tk] = {
+                            "token": pos["token"],
+                            "platform": pos["platform"],
+                            "total_entry_bnb": 0.0,
+                        }
+                    tokens_seen[tk]["total_entry_bnb"] += pos["amount_bnb"] or 0
+
+                for tk, info in tokens_seen.items():
+                    token = info["token"]
+                    total_entry_bnb = info["total_entry_bnb"]
+                    if total_entry_bnb <= 0:
                         continue
 
-                    # Get current on-chain balance
+                    # Get current on-chain balance (once per token)
                     balance = await self.router.get_token_balance(
                         token, wallet["address"], chain,
                     )
@@ -413,12 +430,12 @@ class CopyTradeEngine:
 
                     # Estimate current BNB value
                     current_bnb = await self.router.get_sell_value_bnb(
-                        pos["platform"], token, balance, chain,
+                        info["platform"], token, balance, chain,
                     )
                     if current_bnb <= 0:
                         continue
 
-                    pnl_pct = (current_bnb - entry_bnb) / entry_bnb * 100
+                    pnl_pct = (current_bnb - total_entry_bnb) / total_entry_bnb * 100
 
                     # Check thresholds
                     if pnl_pct >= tp_pct:
@@ -427,8 +444,12 @@ class CopyTradeEngine:
                             f"{token[:10]}... +{pnl_pct:.1f}%",
                             "SUCCESS", "copytrade",
                         )
+                        # Pass first position (sell uses full balance anyway)
                         await self._execute_tpsl_sell(
-                            task_id, task, wallet, pos, balance, "take_profit",
+                            task_id, task, wallet,
+                            {"token": token, "platform": info["platform"],
+                             "amount_bnb": total_entry_bnb},
+                            balance, "take_profit",
                         )
                     elif pnl_pct <= -sl_pct:
                         await self.log.push(
@@ -437,7 +458,10 @@ class CopyTradeEngine:
                             "WARNING", "copytrade",
                         )
                         await self._execute_tpsl_sell(
-                            task_id, task, wallet, pos, balance, "stop_loss",
+                            task_id, task, wallet,
+                            {"token": token, "platform": info["platform"],
+                             "amount_bnb": total_entry_bnb},
+                            balance, "stop_loss",
                         )
 
             except asyncio.CancelledError:
@@ -477,12 +501,13 @@ class CopyTradeEngine:
 
             for plat in platforms_to_try:
                 try:
+                    sell_slippage = SELL_SLIPPAGE_TIERS[min(attempt - 1, len(SELL_SLIPPAGE_TIERS) - 1)]
                     result = await self.router.sell(
                         platform=plat,
                         token=token,
                         amount_token_raw=balance,
                         private_key=wallet["private_key"],
-                        slippage=task["slippage"],
+                        slippage=sell_slippage,
                         gas_multiplier=task["gas_multiplier"],
                         chain=chain,
                     )
@@ -539,7 +564,7 @@ class CopyTradeEngine:
     # Manual sell (user-initiated from UI)
     # ------------------------------------------------------------------
 
-    async def manual_sell(self, position_id: int, slippage: int = 5) -> dict:
+    async def manual_sell(self, position_id: int) -> dict:
         """Sell an open position manually. Returns {tx_hash, bnb_out} or raises."""
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -579,7 +604,7 @@ class CopyTradeEngine:
             token=token,
             amount_token_raw=balance,
             private_key=wallet["private_key"],
-            slippage=slippage,
+            slippage=SELL_SLIPPAGE_TIERS[0],
             gas_multiplier=pos.get("gas_multiplier", 1.2),
             chain=chain,
         )
@@ -702,10 +727,20 @@ class CopyTradeEngine:
             rows = [dict(r) for r in await cur.fetchall()]
 
             for pos in rows:
+                total_entry += pos["amount_bnb"] or 0
+
+            for pos in rows:
                 entry_bnb = pos["amount_bnb"] or 0
-                total_entry += entry_bnb
-                profit_bnb = sell_bnb - entry_bnb if sell_bnb else None
-                profit_pct = (profit_bnb / entry_bnb * 100) if (profit_bnb is not None and entry_bnb > 0) else None
+                # Distribute sell_bnb proportionally across positions
+                if sell_bnb and total_entry > 0:
+                    share = entry_bnb / total_entry
+                    pos_sell_bnb = sell_bnb * share
+                    profit_bnb = pos_sell_bnb - entry_bnb
+                    profit_pct = (profit_bnb / entry_bnb * 100) if entry_bnb > 0 else None
+                else:
+                    pos_sell_bnb = None
+                    profit_bnb = None
+                    profit_pct = None
                 await db.execute(
                     """UPDATE copy_positions
                        SET status = 'closed', sell_tx_hash = ?,
@@ -713,7 +748,7 @@ class CopyTradeEngine:
                            profit_bnb = ?, profit_pct = ?,
                            sold_at = CURRENT_TIMESTAMP
                        WHERE id = ?""",
-                    (tx_hash, sell_bnb or None, reason or None,
+                    (tx_hash, pos_sell_bnb, reason or None,
                      profit_bnb, profit_pct, pos["id"]),
                 )
             await db.commit()

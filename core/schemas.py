@@ -49,7 +49,6 @@ class CopyTaskCreateRequest(BaseModel):
     buy_config: dict = Field(default_factory=dict)
     sell_mode: Literal["copy_sell", "tp_sl", "both"]
     sell_config: dict = Field(default_factory=dict)
-    slippage: int = Field(default=10, ge=1, le=99)
     gas_multiplier: float = Field(default=1.2, ge=1.0, le=3.0)
 
 

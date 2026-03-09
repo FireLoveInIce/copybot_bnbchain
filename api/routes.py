@@ -411,8 +411,8 @@ def build_router(
                    (target_address, wallet_id, listener_task_id,
                     buy_mode, buy_value, buy_config,
                     sell_mode, sell_config,
-                    slippage, gas_multiplier, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+                    gas_multiplier, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
                 (
                     lt["target_address"],
                     payload.wallet_id,
@@ -422,7 +422,6 @@ def build_router(
                     json.dumps(payload.buy_config),
                     payload.sell_mode,
                     json.dumps(payload.sell_config),
-                    payload.slippage,
                     payload.gas_multiplier,
                 ),
             )
@@ -537,11 +536,10 @@ def build_router(
         )
 
     @router.post("/api/copy-positions/{position_id}/sell")
-    async def manual_sell_position(position_id: int, payload: dict = {}):
+    async def manual_sell_position(position_id: int):
         """Manually sell an open copy trade position."""
-        slippage = payload.get("slippage", 5) if payload else 5
         try:
-            result = await copy_engine.manual_sell(position_id, slippage=slippage)
+            result = await copy_engine.manual_sell(position_id)
             return {"status": "ok", **result}
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -746,26 +744,6 @@ def build_router(
             runtime.start_job(key, lambda tid=t["id"]: listener_engine.run_listener_task(tid))
         await log_service.push(
             f"RPC switched to config #{config_id}, restarted {len(running_listeners)} listener(s)",
-            "INFO", "system",
-        )
-        return {"status": "ok"}
-
-    @router.patch("/api/rpc-configs/{config_id}/trade-rpc")
-    async def set_trade_rpc(config_id: int, payload: dict):
-        """Set a dedicated trade RPC URL (MEV protection) for an RPC config."""
-        trade_url = (payload.get("trade_rpc_url") or "").strip()
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "UPDATE rpc_configs SET trade_rpc_url = ? WHERE id = ?",
-                (trade_url, config_id),
-            )
-            await db.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="RPC config not found")
-        rpc_manager.invalidate()
-        label = trade_url[:40] + "..." if len(trade_url) > 40 else trade_url
-        await log_service.push(
-            f"Trade RPC {'set to ' + label if trade_url else 'cleared'} on config #{config_id}",
             "INFO", "system",
         )
         return {"status": "ok"}

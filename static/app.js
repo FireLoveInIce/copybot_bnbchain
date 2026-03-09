@@ -82,7 +82,6 @@ createApp({
         sell_mode: "both",
         takeProfit: 50,
         stopLoss: 20,
-        slippage: 10,
         gas_multiplier: 1.2,
       },
 
@@ -323,7 +322,7 @@ createApp({
     async loadRpcConfigs() {
       try {
         const configs = await this.api("/api/rpc-configs");
-        for (const r of configs) r._tradeRpc = r.trade_rpc_url || "";
+        // configs loaded
         this.rpcConfigs = configs;
       } catch (_) {}
     },
@@ -641,7 +640,7 @@ createApp({
       try {
         const r = await this.api(`/api/copy-positions/${rec.position_id}/sell`, {
           method: "POST",
-          body: JSON.stringify({ slippage: this.selectedCopyTask?.slippage || 5 }),
+          body: JSON.stringify({}),
         });
         this.showToast(`Sell submitted: ${r.tx_hash ? r.tx_hash.slice(0,12) + '...' : r.message}`);
         await this.loadCopyRecords(this.selectedCopyTask.id);
@@ -912,7 +911,6 @@ createApp({
             buy_config,
             sell_mode: f.sell_mode,
             sell_config,
-            slippage: Number(f.slippage),
             gas_multiplier: Number(f.gas_multiplier),
           }),
         });
@@ -1003,17 +1001,6 @@ createApp({
         this.showToast("RPC switched");
         await this.loadRpcConfigs();
       } catch (e) { this.showToast(`Switch failed: ${e.message}`); }
-    },
-    async saveTradeRpc(r) {
-      const url = (r._tradeRpc || "").trim();
-      try {
-        await this.api(`/api/rpc-configs/${r.id}/trade-rpc`, {
-          method: "PATCH",
-          body: JSON.stringify({ trade_rpc_url: url }),
-        });
-        r.trade_rpc_url = url;
-        this.showToast(url ? "Trade RPC saved" : "Trade RPC cleared");
-      } catch (e) { this.showToast(`Save failed: ${e.message}`); }
     },
     async deleteRpc(id) {
       try {

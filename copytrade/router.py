@@ -187,6 +187,8 @@ _ERC20_ABI = [
 ]
 
 MAX_UINT256 = 2**256 - 1
+DEFAULT_GAS_LIMIT = 500_000
+GAS_ESTIMATE_BUFFER = 1.4  # 40% buffer over estimate
 
 
 class TradeRouter:
@@ -197,11 +199,18 @@ class TradeRouter:
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
+    async def _estimate_gas(self, w3, tx_params: dict) -> int:
+        """Estimate gas with buffer, fallback to DEFAULT_GAS_LIMIT."""
+        try:
+            estimate = await w3.eth.estimate_gas(tx_params)
+            return int(estimate * GAS_ESTIMATE_BUFFER)
+        except Exception as exc:
+            logger.debug("gas estimate failed (%s), using default %d", exc, DEFAULT_GAS_LIMIT)
+            return DEFAULT_GAS_LIMIT
+
     async def _send_and_verify(self, w3, signed_tx, timeout: int = 60) -> str:
         """Send tx and wait for receipt. Raises if reverted. Returns tx_hash hex."""
-        # Use trade RPC for sending if available (MEV protection)
-        send_w3 = await self.rpc.get_trade_http() or w3
-        tx_hash = await send_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        tx_hash = await w3.eth.send_raw_transaction(signed_tx.rawTransaction)
         receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
         if receipt.get("status") == 0:
             raise RuntimeError(f"tx reverted: {tx_hash.hex()}")
@@ -248,16 +257,21 @@ class TradeRouter:
         estimated = await contract.functions.previewBuy(token, amount_wei).call()
         min_out = int(estimated * (100 - slippage) / 100)
 
-        tx = await contract.functions.buy(
-            token, account.address, min_out,
-        ).build_transaction({
+        tx_params = {
             "from": account.address,
             "value": amount_wei,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": contract_addr,
+            "data": contract.functions.buy(token, account.address, min_out)._encode_transaction_data(),
         })
+        tx = await contract.functions.buy(
+            token, account.address, min_out,
+        ).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_tokens": str(estimated)}
@@ -278,16 +292,21 @@ class TradeRouter:
         except Exception:
             pass
 
-        tx = await contract.functions.buyTokenAMAP(
-            token, amount_wei, min_amount,
-        ).build_transaction({
+        tx_params = {
             "from": account.address,
             "value": amount_wei,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": contract_addr,
+            "data": contract.functions.buyTokenAMAP(token, amount_wei, min_amount)._encode_transaction_data(),
         })
+        tx = await contract.functions.buyTokenAMAP(
+            token, amount_wei, min_amount,
+        ).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_tokens": str(estimated)}
@@ -301,16 +320,23 @@ class TradeRouter:
         min_out = int(amounts[-1] * (100 - slippage) / 100)
         deadline = int(time.time()) + 300
 
-        tx = await router.functions.swapExactETHForTokens(
-            min_out, [wbnb, token], account.address, deadline,
-        ).build_transaction({
+        tx_params = {
             "from": account.address,
             "value": amount_wei,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": router_addr,
+            "data": router.functions.swapExactETHForTokens(
+                min_out, [wbnb, token], account.address, deadline,
+            )._encode_transaction_data(),
         })
+        tx = await router.functions.swapExactETHForTokens(
+            min_out, [wbnb, token], account.address, deadline,
+        ).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_tokens": str(amounts[-1])}
@@ -357,7 +383,7 @@ class TradeRouter:
             return nonce
         tx = await erc20.functions.approve(spender, MAX_UINT256).build_transaction({
             "from": account.address,
-            "gas": 60_000,
+            "gas": 100_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
@@ -379,13 +405,18 @@ class TradeRouter:
         estimated_bnb = await contract.functions.previewSell(token, amount).call()
         min_out = int(estimated_bnb * (100 - slippage) / 100)
 
-        tx = await contract.functions.sell(token, amount, min_out).build_transaction({
+        tx_params = {
             "from": account.address,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": contract_addr,
+            "data": contract.functions.sell(token, amount, min_out)._encode_transaction_data(),
         })
+        tx = await contract.functions.sell(token, amount, min_out).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_bnb": estimated_bnb / 1e18}
@@ -411,15 +442,20 @@ class TradeRouter:
         except Exception:
             pass
 
-        tx = await contract.functions.sellToken(
-            token, amount, min_funds,
-        ).build_transaction({
+        tx_params = {
             "from": account.address,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": contract_addr,
+            "data": contract.functions.sellToken(token, amount, min_funds)._encode_transaction_data(),
         })
+        tx = await contract.functions.sellToken(
+            token, amount, min_funds,
+        ).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_bnb": estimated_bnb_wei / 1e18}
@@ -437,15 +473,22 @@ class TradeRouter:
         min_out = int(amounts[-1] * (100 - slippage) / 100)
         deadline = int(time.time()) + 300
 
-        tx = await router.functions.swapExactTokensForETH(
-            amount, min_out, [token, wbnb], account.address, deadline,
-        ).build_transaction({
+        tx_params = {
             "from": account.address,
-            "gas": 300_000,
             "gasPrice": gas_price,
             "nonce": nonce,
             "chainId": 56,
+        }
+        tx_params["gas"] = await self._estimate_gas(w3, {
+            **tx_params,
+            "to": router_addr,
+            "data": router.functions.swapExactTokensForETH(
+                amount, min_out, [token, wbnb], account.address, deadline,
+            )._encode_transaction_data(),
         })
+        tx = await router.functions.swapExactTokensForETH(
+            amount, min_out, [token, wbnb], account.address, deadline,
+        ).build_transaction(tx_params)
         signed = account.sign_transaction(tx)
         tx_hash = await self._send_and_verify(w3, signed)
         return {"tx_hash": tx_hash, "estimated_bnb": amounts[-1] / 1e18}

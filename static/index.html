@@ -963,10 +963,6 @@
                     </template>
 
                     <div class="field">
-                        <label>Slippage (%)</label>
-                        <input v-model.number="copyForm.slippage" type="number" min="1" max="99" placeholder="5">
-                    </div>
-                    <div class="field">
                         <label>Gas Multiplier</label>
                         <input v-model.number="copyForm.gas_multiplier" type="number" min="1" max="3" step="0.1" placeholder="1.2">
                     </div>
@@ -991,7 +987,7 @@
                 <table>
                     <thead><tr>
                         <th>ID</th><th>Listener</th><th>Wallet</th>
-                        <th>Buy</th><th>Sell</th><th>Slippage</th>
+                        <th>Buy</th><th>Sell</th>
                         <th>Status</th><th>Actions</th>
                     </tr></thead>
                     <tbody>
@@ -1015,7 +1011,6 @@
                             <td>
                                 <span style="font-size:11px">{{ fmtSellConfig(t) }}</span>
                             </td>
-                            <td>{{ t.slippage }}%</td>
                             <td><span class="badge" :class="'badge-'+t.status">{{ t.status }}</span></td>
                             <td>
                                 <div class="btn-row">
@@ -1173,7 +1168,7 @@
             </div>
             <div class="card-body">
                 <table>
-                    <thead><tr><th>Nickname</th><th>HTTP RPC</th><th>Trade RPC (MEV)</th><th>Chain</th><th>Status</th><th>Actions</th></tr></thead>
+                    <thead><tr><th>Nickname</th><th>HTTP RPC</th><th>Chain</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody>
                         <tr v-for="r in rpcConfigs" :key="r.id"
                             :style="r.active ? 'background:rgba(31,216,200,.04)' : ''">
@@ -1182,15 +1177,6 @@
                                 <span v-if="r.is_default" class="badge" style="margin-left:4px;font-size:9px;color:var(--muted);border-color:var(--line)">built-in</span>
                             </td>
                             <td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" :title="r.rpc_url">{{ r.rpc_url }}</td>
-                            <td style="max-width:240px">
-                                <div v-if="r.active" style="display:flex;gap:4px;align-items:center">
-                                    <input v-model="r._tradeRpc" :placeholder="'e.g. https://rpc-bsc.48.club'"
-                                           style="font-size:11px;padding:4px 6px;flex:1;min-width:0" @keyup.enter="saveTradeRpc(r)">
-                                    <button class="btn btn-alt" style="font-size:10px;padding:3px 8px;white-space:nowrap" @click="saveTradeRpc(r)">Save</button>
-                                </div>
-                                <span v-else class="mono muted" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block"
-                                      :title="r.trade_rpc_url">{{ r.trade_rpc_url || '-' }}</span>
-                            </td>
                             <td class="muted">{{ r.chain }}</td>
                             <td>
                                 <span v-if="r.active" class="badge badge-running" style="font-weight:700">Using</span>

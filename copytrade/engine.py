@@ -35,14 +35,19 @@ from rpc.manager import RpcManager
 logger = logging.getLogger(__name__)
 
 # TP/SL price check interval
-TPSL_CHECK_INTERVAL = 15  # seconds
+TPSL_CHECK_INTERVAL = 7  # seconds
 
-# Retry settings
-BUY_SLIPPAGE_TIERS = [10, 15, 20, 15, 20]  # escalating slippage per attempt
-BUY_MAX_RETRIES = len(BUY_SLIPPAGE_TIERS)
+# Retry settings for Bonding Curve (Flap/Fourmeme) - High tolerance to ensure execution
+BUY_SLIPPAGE_TIERS = [10, 15, 20, 20, 20]  # escalating slippage per attempt
 SELL_SLIPPAGE_TIERS = [10, 15, 15, 20, 20]  # for sell retries
-SELL_MAX_RETRIES = 50  # effectively unlimited — sell until success
+
+# Retry settings for DEX (PancakeSwap V2/V3) - Tighter slippage to prevent MEV sandwich attacks
+DEX_BUY_SLIPPAGE_TIERS = [2, 5, 10, 15] 
+DEX_SELL_SLIPPAGE_TIERS = [2, 5, 10, 15]
+
 RETRY_BASE_DELAY = 2  # seconds
+BUY_RETRY_DELAY = 3  # fixed retry delay for buys
+SELL_RETRY_DELAY = 3  # fixed retry delay for sells
 
 
 class CopyTradeEngine:
@@ -188,6 +193,7 @@ class CopyTradeEngine:
         amount_wei = int(amount_bnb * 1e18)
         token = event.token
         platform = event.platform
+        chain = task.get("chain", "bsc")
 
         if not token or token == "UNKNOWN":
             await self.log.push(
@@ -195,24 +201,35 @@ class CopyTradeEngine:
             )
             return
 
-        # Retry loop with escalating slippage: 5→10→10→15→20
-        for attempt in range(1, BUY_MAX_RETRIES + 1):
-            slippage = BUY_SLIPPAGE_TIERS[attempt - 1]
+        # Check if graduated to DEX for dynamic slippage assignment
+        dex_info = await self.router.check_dex_liquidity(token, chain)
+        if dex_info:
+            tiers = DEX_BUY_SLIPPAGE_TIERS
+            platform_display = f"PCS {dex_info[0].upper()}"
+        else:
+            tiers = BUY_SLIPPAGE_TIERS
+            platform_display = platform
+
+        max_retries = len(tiers)
+
+        # Retry loop with dynamically assigned escalating slippage
+        for attempt in range(1, max_retries + 1):
+            slippage = tiers[attempt - 1]
             try:
                 await self.log.push(
-                    f"copy #{task_id}: BUY attempt {attempt}/{BUY_MAX_RETRIES} "
-                    f"{amount_bnb:.4f} BNB → {token[:10]}... on {platform} (slippage {slippage}%)",
+                    f"copy #{task_id}: BUY attempt {attempt}/{max_retries} "
+                    f"{amount_bnb:.4f} BNB → {token[:10]}... on {platform_display} (slippage {slippage}%)",
                     "INFO", "copytrade",
                 )
 
                 result = await self.router.buy(
-                    platform=platform,
+                    platform=platform, # Router will internally override to "dex" if dex_info exists
                     token=token,
                     amount_bnb_wei=amount_wei,
                     private_key=wallet["private_key"],
                     slippage=slippage,
                     gas_multiplier=task["gas_multiplier"],
-                    chain=task.get("chain", "bsc"),
+                    chain=chain,
                 )
 
                 tx_hash = result["tx_hash"]
@@ -232,7 +249,7 @@ class CopyTradeEngine:
                     amount=amount_bnb,
                     amount_token=estimated_tokens,
                     platform=platform,
-                    chain=task.get("chain", "bsc"),
+                    chain=chain,
                 )
 
                 await self.log.push(
@@ -243,8 +260,8 @@ class CopyTradeEngine:
                 return  # success — exit retry loop
 
             except Exception as exc:
-                if attempt < BUY_MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * attempt
+                if attempt < max_retries:
+                    delay = BUY_RETRY_DELAY
                     await self.log.push(
                         f"copy #{task_id}: BUY attempt {attempt} failed — {exc}, "
                         f"retrying in {delay}s...",
@@ -253,7 +270,7 @@ class CopyTradeEngine:
                     await asyncio.sleep(delay)
                 else:
                     await self.log.push(
-                        f"copy #{task_id}: BUY failed after {BUY_MAX_RETRIES} attempts — {exc}",
+                        f"copy #{task_id}: BUY failed after {max_retries} attempts — {exc}",
                         "ERROR", "copytrade",
                     )
 
@@ -273,6 +290,15 @@ class CopyTradeEngine:
         chain = task.get("chain", "bsc")
         wallet_addr = wallet["address"]
 
+        # Check if graduated to DEX for dynamic slippage assignment
+        dex_info = await self.router.check_dex_liquidity(token, chain)
+        if dex_info:
+            tiers = DEX_SELL_SLIPPAGE_TIERS
+        else:
+            tiers = SELL_SLIPPAGE_TIERS
+            
+        max_retries = len(tiers)
+
         # Use the platform we BOUGHT on (from our position), not the target's platform
         positions = await self._open_positions_for_token(task_id, token)
         if not positions:
@@ -285,7 +311,7 @@ class CopyTradeEngine:
         sell_platform = positions[0]["platform"]
 
         # Retry until success
-        for attempt in range(1, SELL_MAX_RETRIES + 1):
+        for attempt in range(1, max_retries + 1):
             # Re-fetch balance each attempt (might change after failed tx)
             try:
                 balance = await self.router.get_token_balance(token, wallet_addr, chain)
@@ -310,12 +336,13 @@ class CopyTradeEngine:
 
             for plat in platforms_to_try:
                 try:
+                    sell_slippage = tiers[min(attempt - 1, len(tiers) - 1)]
                     await self.log.push(
-                        f"copy #{task_id}: SELL attempt {attempt}/{SELL_MAX_RETRIES} "
-                        f"{token[:10]}... on {plat}",
+                        f"copy #{task_id}: SELL attempt {attempt}/{max_retries} "
+                        f"{token[:10]}... on {plat} (slippage {sell_slippage}%)",
                         "INFO", "copytrade",
                     )
-                    sell_slippage = SELL_SLIPPAGE_TIERS[min(attempt - 1, len(SELL_SLIPPAGE_TIERS) - 1)]
+                    
                     result = await self.router.sell(
                         platform=plat,
                         token=token,
@@ -370,7 +397,7 @@ class CopyTradeEngine:
                 return  # done
 
             # All platforms failed this attempt — retry
-            delay = min(RETRY_BASE_DELAY * attempt, 15)
+            delay = SELL_RETRY_DELAY
             await self.log.push(
                 f"copy #{task_id}: SELL attempt {attempt} failed — {last_err}, "
                 f"retrying in {delay}s...",
@@ -379,7 +406,7 @@ class CopyTradeEngine:
             await asyncio.sleep(delay)
 
         await self.log.push(
-            f"copy #{task_id}: SELL {token[:10]}... failed after {SELL_MAX_RETRIES} attempts",
+            f"copy #{task_id}: SELL {token[:10]}... failed after {max_retries} attempts",
             "ERROR", "copytrade",
         )
 
@@ -476,11 +503,20 @@ class CopyTradeEngine:
         chain = task.get("chain", "bsc")
         sell_platform = pos["platform"]
 
+        # Check if graduated to DEX for dynamic slippage assignment
+        dex_info = await self.router.check_dex_liquidity(token, chain)
+        if dex_info:
+            tiers = DEX_SELL_SLIPPAGE_TIERS
+        else:
+            tiers = SELL_SLIPPAGE_TIERS
+            
+        max_retries = len(tiers)
+
         platforms_to_try = [sell_platform]
         if sell_platform != "dex":
             platforms_to_try.append("dex")
 
-        for attempt in range(1, SELL_MAX_RETRIES + 1):
+        for attempt in range(1, max_retries + 1):
             # Re-fetch balance each attempt
             try:
                 balance = await self.router.get_token_balance(
@@ -501,7 +537,7 @@ class CopyTradeEngine:
 
             for plat in platforms_to_try:
                 try:
-                    sell_slippage = SELL_SLIPPAGE_TIERS[min(attempt - 1, len(SELL_SLIPPAGE_TIERS) - 1)]
+                    sell_slippage = tiers[min(attempt - 1, len(tiers) - 1)]
                     result = await self.router.sell(
                         platform=plat,
                         token=token,
@@ -547,7 +583,7 @@ class CopyTradeEngine:
                 )
                 return  # done
 
-            delay = min(RETRY_BASE_DELAY * attempt, 15)
+            delay = SELL_RETRY_DELAY
             await self.log.push(
                 f"copy #{task_id}: {reason} sell attempt {attempt} failed — {last_err}, "
                 f"retrying in {delay}s...",
@@ -556,7 +592,7 @@ class CopyTradeEngine:
             await asyncio.sleep(delay)
 
         await self.log.push(
-            f"copy #{task_id}: {reason} SELL {token[:10]}... failed after {SELL_MAX_RETRIES} attempts",
+            f"copy #{task_id}: {reason} SELL {token[:10]}... failed after {max_retries} attempts",
             "ERROR", "copytrade",
         )
 
@@ -599,12 +635,19 @@ class CopyTradeEngine:
             )
             return {"tx_hash": "", "bnb_out": 0, "message": "zero balance, position closed"}
 
+        # Check if graduated to DEX for dynamic slippage assignment
+        dex_info = await self.router.check_dex_liquidity(token, chain)
+        if dex_info:
+            sell_slippage = DEX_SELL_SLIPPAGE_TIERS[0]
+        else:
+            sell_slippage = SELL_SLIPPAGE_TIERS[0]
+
         result = await self.router.sell(
             platform=platform,
             token=token,
             amount_token_raw=balance,
             private_key=wallet["private_key"],
-            slippage=SELL_SLIPPAGE_TIERS[0],
+            slippage=sell_slippage,
             gas_multiplier=pos.get("gas_multiplier", 1.2),
             chain=chain,
         )

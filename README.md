@@ -41,3 +41,5 @@ Clone the repository to your local machine
 pip install -r requirements.txt
 
 python main.py
+
+go http://localhost:8000
